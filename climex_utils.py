@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-from cartopy import crs as ccrs, feature as cfeature
+from cartopy import crs as ccrs
 
 import torch
 import torch.nn as nn
@@ -40,7 +40,7 @@ class climexSet(Dataset):
     def __init__(self, datadir, years=range(1960,2039), variables=["pr", "tasmin", "tasmax"], coords=[150, 182, 135, 167], train = True, trainset = None, lowres_scale = 4, time_transform=None):
 
         """
-        path_dir: (str) path to the directory containing NetCDF files;
+        datadir: (str) path to the directory containing NetCDF files;
         years: (list of int) indicates which years should climexSet import data from;
         variables: (list of str) indicates what variables should climexSet import data from;
         coords: (list of int) (form: [start_rlon, end_rlon, start_rlat, end_rlat]) climexSet will only import data from the resulting window:
@@ -137,8 +137,8 @@ class climexSet(Dataset):
     def residual_to_hr(self, residual, lrinterp):
         return lrinterp + self.invstand_residual(residual)
     
-    # Plot a batch (N) of samples (low-resolution, predicted high-resolution, groundtruth high-resolution)
-    def plot_batch(self, lr, hr_pred, hr, timestamps, epoch, N=2):
+    # Plot a batch (N) of samples (upsampled low-resolution, predicted high-resolution, groundtruth high-resolution)
+    def plot_batch(self, lrinterp, hr_pred, hr, timestamps, epoch, N=2):
 
         # Initializing Plate Carrée projection (for other projections see https://scitools.org.uk/cartopy/docs/latest/reference/crs.html)
         prj = ccrs.PlateCarree()
@@ -170,7 +170,7 @@ class climexSet(Dataset):
                     unit = " (mm/day)"
 
                     # Converting units in mm/day and computing scaling values for colormap
-                    lr_sample, hr_pred_sample, hr_sample = kgm2sTommday(lr[j,i]), kgm2sTommday(hr_pred[j,i]), kgm2sTommday(hr[j,i])
+                    lr_sample, hr_pred_sample, hr_sample = kgm2sTommday(lrinterp[j,i]), kgm2sTommday(hr_pred[j,i]), kgm2sTommday(hr[j,i])
                     vmin, vmax = 0, max(torch.amax(lr_sample), torch.amax(hr_pred_sample), torch.amax(hr_sample))
 
                     # Setting cartopy features on the Axes objects
@@ -200,7 +200,7 @@ class climexSet(Dataset):
                     unit = " (°C)"
 
                     # Converting units in °C and computing scaling values for diverging colormap
-                    lr_sample, hr_pred_sample, hr_sample = KToC(lr[j,i]), KToC(hr_pred[j,i]), KToC(hr[j,i])
+                    lr_sample, hr_pred_sample, hr_sample = KToC(lrinterp[j,i]), KToC(hr_pred[j,i]), KToC(hr[j,i])
                     max_abs =  max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.amax(hr_pred_sample)), torch.amax(torch.amax(hr_sample)))
                     vmin, vmax = -max_abs, max_abs
 
