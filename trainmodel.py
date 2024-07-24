@@ -10,8 +10,14 @@ warnings.filterwarnings('ignore')
 
 def get_args():
 
+    """
+    This function returns a dictionary containing all necessary arguments for importing ClimEx data, training, evaluating and sampling from a downscaling ML model.
+    This function is helpful for doing sweeps and performing hyperparameter tuning.
+    """
+
     parser = argparse.ArgumentParser()
 
+    # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
     parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
     parser.add_argument('--years_train', type=range, default=range(1960, 2059))
@@ -22,58 +28,70 @@ def get_args():
     parser.add_argument('--lowres_scale', type=int, default=4)
     parser.add_argument('--timetransform', type=str, default='id', choices=['id', 'cyclic'])
 
+    # ML training arguments
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=3e-05)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
 
+    # GPU
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
 
+    # saving results arguments
     strtime = datetime.now().strftime('%m/%d/%Y, %H:%M:%S')
     plotdir = './' + strtime + '/'
     parser.add_argument('--plotdir', type=str, default=plotdir)
     if not os.path.isdir(plotdir):
         os.makedirs(plotdir)
 
+    # Generating the dictionary
     args, unknown = parser.parse_known_args()
 
     return args
 
+
 def train_step(model, dataloader, loss_fn, optimizer, scaler, step, accum, device):
 
     """
-    Function for a single training step.
-    :param model: instance of the Unet class
-    :param loss_fn: loss function
-    :param data_loader: data loader
-    :param optimiser: optimiser to use
-    :param scaler: scaler for mixed precision training
-    :param step: current step
-    :param accum: number of steps to accumulate gradients over
-    :param writer: tensorboard writer
-    :param device: device to use
-    :return: loss value
+    Function for training the UNet model for a single epoch.
+
+    model: instance of the Unet class
+    dataloader: torch training dataloader
+    loss_fn: loss function
+    optimizer: torch optimizer 
+    scaler: scaler for mixed precision training
+    step: current epoch
+    accum: number of steps to accumulate gradients over
+    device: device to use (GPU)
+
+    return -> average loss value over the epoch
     """
 
     model.train()
 
+    # Activating progress bar
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
         tq.set_description(f'Train :: Epoch: {step}')
 
         running_losses = []
+        # Looping over the entire dataloader set
         for i, batch in enumerate(dataloader):
             tq.update(1)
 
+            # Extracting training data from batch
             inputs, targets = (batch['inputs'].to(device), batch['targets'].to(device))
             timestamps = batch['timestamps'].unsqueeze(dim=1).to(device)
 
+            # Performing forward pass of the unet model qnd computing loss
             with torch.cuda.amp.autocast():
                 preds = model(inputs, class_labels=timestamps)
                 loss = loss_fn(preds, targets)
 
+            # Performing backprograpation
             scaler.scale(loss).backward()
 
+            # Updating optimizer every accum steps
             if (i + 1) % accum == 0:
                 scaler.step(optimizer)
                 scaler.update()
@@ -91,20 +109,29 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, step, accum, devic
 def sample_model(model, dataloader, epoch, device):
 
     """
-    Function for sampling the model.
-    :param model: instance of the Unet class
-    :param dataloader: data loader
+    Function for sampling from the unet model and plotting results.
+
+    model: instance of the Unet class
+    dataloader: torch dataloader (should be shuffled)
+    epoch: current epoch
+    device: device to use (GPU)
+
+    return -> predicted high-resolution samples, plots
     """
 
     model.eval()
 
+    # Extracting data from the first batch of the dataloader
     batch = next(iter(dataloader))
-
     inputs, lrinterp, hr, timestamps = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps'])
+
+    # Performing forward pass on the unet
     residual_preds = model(inputs, class_labels=timestamps.unsqueeze(dim=1).to(device))
 
+    # Converting predicted residual to high-resolution sample
     hr_pred = dataloader.dataset.residual_to_hr(residual_preds.detach().cpu(), lrinterp)
 
+    # Plotting the results
     fig, axs = dataloader.dataset.plot_batch(lrinterp, hr_pred, hr, timestamps, epoch)
 
     return hr_pred, (fig, axs)
@@ -112,18 +139,33 @@ def sample_model(model, dataloader, epoch, device):
 @torch.no_grad()
 def eval_model(model, dataloader, loss_fn, device):
 
+    """
+    Function for evaluating the unet model.
+
+    model: instance of the Unet class
+    dataloader: torch dataloader 
+    loss_fn: loss function used for evaluation
+    device: device to use (GPU)
+
+    return -> averaged loss over the dataloader set
+    """
+
     model.eval()
 
+    # Activating progress bar
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
         tq.set_description(':: Evaluation ::')
 
         running_losses = []
+        # Looping over the entire dataloader set
         for i, batch in enumerate(dataloader):
             tq.update(1)
 
+            # Extracting training data from batch and performing forward pass
             inputs, targets, timestamps = (batch['inputs'].to(device), batch['targets'].to(device), batch['timestamps'])
             residual_preds = model(inputs, class_labels=timestamps.unsqueeze(dim=1).to(device))
 
+            # Computing loss function
             loss = loss_fn(residual_preds, targets)
             running_losses.append(loss.item())
 
