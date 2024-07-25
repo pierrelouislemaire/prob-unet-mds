@@ -2,6 +2,7 @@ import os
 import warnings
 import argparse
 import torch
+import wandb
 
 from tqdm import tqdm
 from datetime import datetime
@@ -30,7 +31,7 @@ def get_args():
 
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=30)
+    parser.add_argument('--num_epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=3e-05)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
@@ -39,8 +40,8 @@ def get_args():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
 
     # saving results arguments
-    strtime = datetime.now().strftime('%m/%d/%Y, %H:%M:%S')
-    plotdir = './' + strtime + '/'
+    strtime = datetime.now().strftime('%m/%d/%Y%H:%M:%S')
+    plotdir = './results/plots/' + strtime + '/'
     parser.add_argument('--plotdir', type=str, default=plotdir)
     if not os.path.isdir(plotdir):
         os.makedirs(plotdir)
@@ -51,7 +52,7 @@ def get_args():
     return args
 
 
-def train_step(model, dataloader, loss_fn, optimizer, scaler, step, accum, device):
+def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs, accum, device):
 
     """
     Function for training the UNet model for a single epoch.
@@ -61,7 +62,8 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, step, accum, devic
     loss_fn: loss function
     optimizer: torch optimizer 
     scaler: scaler for mixed precision training
-    step: current epoch
+    epoch: current epoch
+    num_epochs: total number of epochs
     accum: number of steps to accumulate gradients over
     device: device to use (GPU)
 
@@ -72,7 +74,7 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, step, accum, devic
 
     # Activating progress bar
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
-        tq.set_description(f'Train :: Epoch: {step}')
+        tq.set_description(f'Train :: Epoch: {epoch}/{num_epochs}')
 
         running_losses = []
         # Looping over the entire dataloader set
@@ -87,6 +89,9 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, step, accum, devic
             with torch.cuda.amp.autocast():
                 preds = model(inputs, class_labels=timestamps)
                 loss = loss_fn(preds, targets)
+
+            # Logging training loss in wandb
+            wandb.log(data={"train-loss": loss.item()})
 
             # Performing backprograpation
             scaler.scale(loss).backward()
@@ -113,7 +118,7 @@ def sample_model(model, dataloader, epoch, device):
 
     model: instance of the Unet class
     dataloader: torch dataloader (should be shuffled)
-    epoch: current epoch
+    epoch: last training epoch
     device: device to use (GPU)
 
     return -> predicted high-resolution samples, plots
@@ -145,6 +150,7 @@ def eval_model(model, dataloader, loss_fn, device):
     model: instance of the Unet class
     dataloader: torch dataloader 
     loss_fn: loss function used for evaluation
+    epoch: last training epoch
     device: device to use (GPU)
 
     return -> averaged loss over the dataloader set
@@ -168,6 +174,8 @@ def eval_model(model, dataloader, loss_fn, device):
             # Computing loss function
             loss = loss_fn(residual_preds, targets)
             running_losses.append(loss.item())
+
+            wandb.log(data={"val-loss": loss.item()})
 
         mean_loss = sum(running_losses) / len(running_losses)
         tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')

@@ -49,6 +49,8 @@ class climexSet(Dataset):
         lowres_scale: (int) downscaling factor.
         """
 
+        super().__init__()
+
         self.variables = variables
         self.nvars = len(variables)
         self.train = train
