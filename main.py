@@ -13,12 +13,14 @@ if __name__ == "__main__":
     args = tm.get_args()
 
     # Initializing WandB
-    wandb.init(project="prob-unet-mds")
+    if args.wandb:
+        wandb.init(project="prob-unet-mds", config=args)
 
     # Initializing the UNet model
     unet_model = nw.UNet(img_resolution=args.resolution, in_channels=len(args.variables), out_channels=len(args.variables), label_dim=0, use_diffuse=False)
     unet_model.to(args.device)
-    wandb.watch(models=unet_model)
+    if args.wandb:
+        wandb.watch(models=unet_model)
 
     # Initiliazing the training and testing dataset
     dataset_train = cu.climexSet(args.datadir, years=args.years_train, coords=args.coords, lowres_scale=args.lowres_scale, train=True)
@@ -42,15 +44,15 @@ if __name__ == "__main__":
     for epoch in range(1, args.num_epochs+1):
 
         # Training for one epoch (going over all training data)
-        epoch_tr_loss = tm.train_step(model=unet_model, dataloader=dataloader_train, loss_fn=loss_fn, optimizer=optimizer, scaler=scaler, epoch=epoch, num_epochs=args.num_epochs, accum=args.accum, device=args.device)
+        epoch_tr_loss = tm.train_step(model=unet_model, dataloader=dataloader_train, loss_fn=loss_fn, optimizer=optimizer, scaler=scaler, epoch=epoch, num_epochs=args.num_epochs, accum=args.accum, wandb=args.wandb, device=args.device)
         tr_losses.append(epoch_tr_loss)
 
         # Evaluating the model on testing data
-        epoch_val_loss = tm.eval_model(model=unet_model, dataloader=dataloader_test, loss_fn=loss_fn, device=args.device)
+        epoch_val_loss = tm.eval_model(model=unet_model, dataloader=dataloader_test, loss_fn=loss_fn, wandb=args.wandb, device=args.device)
         val_losses.append(epoch_val_loss)
 
         # Sampling from the model every 5 epochs
-        if epoch % 5 == 0:
+        if epoch % 1 == 0:
             hr_pred, (fig, axs) = tm.sample_model(model=unet_model, dataloader=dataloader_test_random, epoch=epoch, device=args.device)
             fig.savefig(f"./{args.plotdir}/epoch{epoch}.png", dpi=300)
             plt.close(fig)

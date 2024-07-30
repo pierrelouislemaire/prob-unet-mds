@@ -21,9 +21,9 @@ def get_args():
     # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
     parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
-    parser.add_argument('--years_train', type=range, default=range(1960, 2059))
-    parser.add_argument('--years_val', type=range, default=range(2060, 2079))
-    parser.add_argument('--years_test', type=range, default=range(2080, 2098))
+    parser.add_argument('--years_train', type=range, default=range(1960, 1965))
+    parser.add_argument('--years_val', type=range, default=range(1966, 1970))
+    parser.add_argument('--years_test', type=range, default=range(1971, 1975))
     parser.add_argument('--coords', type=list, default=[120, 184, 120, 184])
     parser.add_argument('--resolution', type=tuple, default=(64, 64))
     parser.add_argument('--lowres_scale', type=int, default=4)
@@ -31,10 +31,13 @@ def get_args():
 
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=5)
+    parser.add_argument('--num_epochs', type=int, default=1)
     parser.add_argument('--lr', type=float, default=3e-05)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
+
+    # WandB activation 
+    parser.add_argument('--wandb', type=bool, default=False)
 
     # GPU
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -52,7 +55,7 @@ def get_args():
     return args
 
 
-def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs, accum, device):
+def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs, accum, wandb, device):
 
     """
     Function for training the UNet model for a single epoch.
@@ -65,6 +68,7 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
     epoch: current epoch
     num_epochs: total number of epochs
     accum: number of steps to accumulate gradients over
+    wandb: True if wandb activated
     device: device to use (GPU)
 
     return -> average loss value over the epoch
@@ -91,7 +95,8 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
                 loss = loss_fn(preds, targets)
 
             # Logging training loss in wandb
-            wandb.log(data={"train-loss": loss.item()})
+            if wandb:
+                wandb.log(data={"train-loss": loss.item()})
 
             # Performing backprograpation
             scaler.scale(loss).backward()
@@ -142,7 +147,7 @@ def sample_model(model, dataloader, epoch, device):
     return hr_pred, (fig, axs)
 
 @torch.no_grad()
-def eval_model(model, dataloader, loss_fn, device):
+def eval_model(model, dataloader, loss_fn, wandb, device):
 
     """
     Function for evaluating the unet model.
@@ -151,6 +156,7 @@ def eval_model(model, dataloader, loss_fn, device):
     dataloader: torch dataloader 
     loss_fn: loss function used for evaluation
     epoch: last training epoch
+    wandb: True if wandb activated
     device: device to use (GPU)
 
     return -> averaged loss over the dataloader set
@@ -175,7 +181,8 @@ def eval_model(model, dataloader, loss_fn, device):
             loss = loss_fn(residual_preds, targets)
             running_losses.append(loss.item())
 
-            wandb.log(data={"val-loss": loss.item()})
+            if wandb:
+                wandb.log(data={"val-loss": loss.item()})
 
         mean_loss = sum(running_losses) / len(running_losses)
         tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')

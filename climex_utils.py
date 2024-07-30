@@ -1,6 +1,7 @@
 import glob
 import xarray as xr
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
@@ -53,6 +54,7 @@ class climexSet(Dataset):
 
         self.variables = variables
         self.nvars = len(variables)
+        self.coords = coords
         self.train = train
         self.trainset = trainset
         self.lowres_scale = lowres_scale
@@ -71,7 +73,7 @@ class climexSet(Dataset):
                 files.append(glob.glob("{path}/*_{var}_*_{year}_*".format(path=datadir, var=var, year=year))[0])    
 
         # Importing all NetCDF files into a xarray Dataset with lazy loading and chunking
-        self.data = xr.open_mfdataset(paths=files, chunks={"time":100, "rlon": 100, "rlat":100}, data_vars="minimal", coords="minimal", compat="override")[self.variables]
+        self.data = xr.open_mfdataset(paths=files, chunks={"time":100, "rlon": 100, "rlat":100}, data_vars="minimal", coords="minimal", compat="override")#[self.variables]
 
         # Extracting latitude and longitude data (for plotting function)
         self.lon = self.data.isel(rlon=range(coords[0], coords[1]), rlat=range(coords[2],coords[3])).lon
@@ -80,7 +82,7 @@ class climexSet(Dataset):
         print("Imported all data files into xarray Dataset using lazy loading")
 
         # Loading into memory high-resolution ground-truth data from desired spatial window and converting to Pytorch tensor (time, nvar, height, width)
-        self.hr = torch.tensor(self.data.isel(rlon=slice(coords[0], coords[1]), rlat=slice(coords[2],coords[3])).load().to_array().to_numpy()).transpose(0,1)
+        self.hr = torch.tensor(self.data.isel(rlon=slice(coords[0], coords[1]), rlat=slice(coords[2],coords[3]))[self.variables].load().to_array().to_numpy()).transpose(0,1)
 
         print("Loaded dataset into memory")
 
@@ -90,7 +92,7 @@ class climexSet(Dataset):
         # Interpolating back low-resolution to high-resolution using bilinear upsampling (this will be used as the inputs)
         self.lrinterp = nn.UpsamplingBilinear2d(scale_factor=self.lowres_scale)(self.lr)
 
-        # Computing the residual between the ground-truth and the upsampled approximation
+        # Computing the residual between the ground-truth and the upsampled approximation (this will be used as the targets after being standardized)
         self.residual = self.hr - self.lrinterp
 
         if train:
@@ -142,26 +144,34 @@ class climexSet(Dataset):
     # Plot a batch (N) of samples (upsampled low-resolution, predicted high-resolution, groundtruth high-resolution)
     def plot_batch(self, lrinterp, hr_pred, hr, timestamps, epoch, N=2):
 
-        # Initializing Plate Carrée projection (for other projections see https://scitools.org.uk/cartopy/docs/latest/reference/crs.html)
-        prj = ccrs.PlateCarree()
+        # Initializing Plate Carrée and Rotated Pole projections (for other projections see https://scitools.org.uk/cartopy/docs/latest/reference/crs.html)
+        rotatedpole_prj = ccrs.RotatedPole(pole_longitude=83.0, pole_latitude=42.5)
+        platecarree_proj = ccrs.PlateCarree()
 
         # Initializing figure and subfigures (one subfigure per date)
         fig = plt.figure(figsize=(N * 18, 12), constrained_layout=True)
         subfigs = fig.subfigures(1, N, wspace=0.05)
 
         # Different colormaps for different type of climate variables
-        cmaps = {'pr': cm.get_cmap('GnBu'), 'temp': cm.get_cmap('coolwarm')}
+        prep_colors = [
+            (1., 1., 1.), 
+            (0.5, 0.88, 1.),
+            (0.1, 0.15, 0.8),
+            (0.39, 0.09, 0.66), 
+            (0.85, 0.36, 0.14),
+            (0.99, 0.91, 0.3)
+        ]
+        prep_colormap = mpl.colors.LinearSegmentedColormap.from_list(name="prep", colors=prep_colors)
+        cmaps = {'pr': prep_colormap, 'temp': cm.get_cmap('RdBu_r'), 'error': cm.get_cmap('gist_heat_r')}
 
         axs = []
-        # Batch (N) plotting loop
+        # Batch (N) plotting loop      
         for j in range(N):
 
-            axs.append(subfigs[j].subplots(self.nvars, 3, subplot_kw={'projection': prj}, gridspec_kw={'wspace':0.01, 'hspace':0.005}))
+            axs.append(subfigs[j].subplots(self.nvars, 4, subplot_kw={'projection': rotatedpole_prj}, gridspec_kw={'wspace':0.01, 'hspace':0.005}))
 
             # Extracting latitude and longitude data corresponding to the j-th sample from the batch
             lat, lon = self.lat.sel(time=str(float_to_date(timestamps[j]))[:10]).load().to_numpy().squeeze(), self.lon.sel(time=str(float_to_date(timestamps[j]))[:10]).load().to_numpy().squeeze()
-            lonE, lonW = lon.min(), lon.max()
-            latS, latN = lat.min(), lat.max()
 
             # Variables plotting loop
             for i in range(self.nvars):
@@ -175,26 +185,34 @@ class climexSet(Dataset):
                     lr_sample, hr_pred_sample, hr_sample = kgm2sTommday(lrinterp[j,i]), kgm2sTommday(hr_pred[j,i]), kgm2sTommday(hr[j,i])
                     vmin, vmax = 0, max(torch.amax(lr_sample), torch.amax(hr_pred_sample), torch.amax(hr_sample))
 
+                    # Computing absolute error and setting corresponding vmin, vmax
+                    error_sample = torch.abs(hr_sample - hr_pred_sample)
+                    err_vmin, err_vmax = 0, torch.amax(error_sample)
+
                     # Setting cartopy features on the Axes objects
-                    for l in range(3):
-                        axs[j][i, l].set_extent([lonW, lonE, latS, latN], crs=prj)
+                    for l in range(4):
                         axs[j][i, l].coastlines()
-                        gl = axs[j][i, l].gridlines(crs=prj, draw_labels=True)
-                        gl.xlines = False
-                        gl.ylines = False
+                        gl = axs[j][i, l].gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
                         gl.top_labels = False
                         gl.right_labels = False
                         if l > 0:
                             gl.left_labels = False
 
-                    # Plotting samlpes in the following order: upsampled low-resolution, predicted high-resolution, groundtruth high-resolution
-                    axs[j][i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=prj)
-                    axs[j][i, 1].pcolormesh(lon, lat, hr_pred_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=prj)
-                    im = axs[j][i, 2].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=prj)
+                    # Plotting samples in the following order: upsampled low-resolution, predicted high-resolution, groundtruth high-resolution
+                    axs[j][i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[j][i, 1].pcolormesh(lon, lat, hr_pred_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    im = axs[j][i, 2].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
 
                     # Plotting the colorbar for the row with the correct label
-                    cbar = plt.colorbar(mappable=im, ax=axs[j][i, :], shrink=0.8, extend="max")
+                    cbar = plt.colorbar(mappable=im, ax=axs[j][i, :3], shrink=0.8, extend="max")
                     cbar.set_label(self.variables[i] + unit, fontsize=14)
+
+                    # Plotting error sample sperately because of its different color scale
+                    im_error = axs[j][i, 3].pcolormesh(lon, lat, error_sample, cmap=cmaps["error"], vmin=err_vmin, vmax=err_vmax, transform=platecarree_proj)
+
+                    # Plotting the colorbar for the error
+                    cbar_error = plt.colorbar(mappable=im_error, ax=axs[j][i, 3], shrink=0.8, extend="max")
+                    cbar_error.set_label(self.variables[i] + unit, fontsize=14)
 
                 else:
 
@@ -206,39 +224,44 @@ class climexSet(Dataset):
                     max_abs =  max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.amax(hr_pred_sample)), torch.amax(torch.amax(hr_sample)))
                     vmin, vmax = -max_abs, max_abs
 
+                    # Computing absolute error and setting corresponding vmin, vmax
+                    error_sample = torch.abs(hr_sample - hr_pred_sample)
+                    err_vmin, err_vmax = 0, torch.amax(error_sample)
+
                     # Setting cartopy features on the Axes objects
-                    for l in range(3):
-                        axs[j][i, l].set_extent([lonW, lonE, latS, latN], crs=prj)
+                    for l in range(4):
                         axs[j][i, l].coastlines()
-                        gl = axs[j][i, l].gridlines(crs=prj, draw_labels=True)
-                        gl.xlines = False
-                        gl.ylines = False
+                        gl = axs[j][i, l].gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
                         gl.top_labels = False
                         gl.right_labels = False
                         if l > 0:
                             gl.left_labels = False
 
                     # Plotting samlpes in the following order: upsampled low-resolution, predicted high-resolution, groundtruth high-resolution
-                    axs[j][i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=prj)
-                    axs[j][i, 1].pcolormesh(lon, lat, hr_pred_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=prj)
-                    im = axs[j][i, 2].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=prj)
+                    axs[j][i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[j][i, 1].pcolormesh(lon, lat, hr_pred_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    im = axs[j][i, 2].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
 
                     # Plotting the colorbar for the row with the correct label
-                    cbar = plt.colorbar(mappable=im, ax=axs[j][i, :], shrink=0.8, extend="both")
+                    cbar = plt.colorbar(mappable=im, ax=axs[j][i, :3], shrink=0.8, extend="both")
                     cbar.set_label(self.variables[i] + unit, fontsize=14)
+
+                    # Plotting error sample sperately because of its different color scale
+                    im_error = axs[j][i, 3].pcolormesh(lon, lat, error_sample, cmap=cmaps["error"], vmin=err_vmin, vmax=err_vmax, transform=platecarree_proj)
+
+                    # Plotting the colorbar for the error
+                    cbar_error = plt.colorbar(mappable=im_error, ax=axs[j][i, 3], shrink=0.8, extend="max")
+                    cbar_error.set_label(self.variables[i] + unit, fontsize=14)
 
 
             subfigs[j].suptitle(str(float_to_date(timestamps[j]))[:10], fontsize=16)
 
-        axs[0][0, 0].set_title("Low-resolution", fontsize=14)
-        axs[0][0, 1].set_title("Prediction", fontsize=14)
-        axs[0][0, 2].set_title("High-resolution", fontsize=14)
+            axs[j][0, 0].set_title("Low-resolution", fontsize=14)
+            axs[j][0, 1].set_title("Prediction", fontsize=14)
+            axs[j][0, 2].set_title("High-resolution", fontsize=14)
+            axs[j][0, 3].set_title("Absolute error", fontsize=14)
 
-        axs[1][0, 0].set_title("Low-resolution", fontsize=14)
-        axs[1][0, 1].set_title("Prediction", fontsize=14)
-        axs[1][0, 2].set_title("High-resolution", fontsize=14)
-
-        fig.suptitle("Predictions after the " + str(epoch) + "th epoch for 2 random test dates", fontsize=18, fontweight='bold')
+        fig.suptitle("Predictions after the " + str(epoch) + "th epoch for " + str(N) + " random test dates", fontsize=18, fontweight='bold')
 
         plt.show()
 
