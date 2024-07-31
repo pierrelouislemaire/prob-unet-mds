@@ -21,9 +21,9 @@ def get_args():
     # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
     parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
-    parser.add_argument('--years_train', type=range, default=range(1960, 1965))
-    parser.add_argument('--years_val', type=range, default=range(1966, 1970))
-    parser.add_argument('--years_test', type=range, default=range(1971, 1975))
+    parser.add_argument('--years_train', type=range, default=range(1960, 2060))
+    parser.add_argument('--years_val', type=range, default=range(2060, 2080))
+    parser.add_argument('--years_test', type=range, default=range(2080, 2099))
     parser.add_argument('--coords', type=list, default=[120, 184, 120, 184])
     parser.add_argument('--resolution', type=tuple, default=(64, 64))
     parser.add_argument('--lowres_scale', type=int, default=4)

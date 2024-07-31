@@ -1,10 +1,11 @@
 import glob
+from dask.distributed import Client
 import xarray as xr
 import numpy as np
+
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-
 from cartopy import crs as ccrs
 
 import torch
@@ -52,14 +53,27 @@ class climexSet(Dataset):
 
         super().__init__()
 
+        # Setup dask distributed cluster
+        client = Client()
+
         self.variables = variables
         self.nvars = len(variables)
         self.coords = coords
+        self.width = self.coords[1] - self.coords[0]
+        self.height = self.coords[3] - self.coords[2]
         self.train = train
         self.trainset = trainset
         self.lowres_scale = lowres_scale
         self.time_transform = time_transform
         self.epsilon = 1e-10 #used for standardization
+
+        self.chunksize = int(28616000/(self.height * self.width))
+        if self.chunksize > 365 * len(years):
+            self.chunksize = 365 * len(years)
+
+        # Preprocessing function to select only desired coordinates
+        def select_coords(ds):
+            return ds.isel(rlon=slice(coords[0], coords[1]), rlat=slice(coords[2],coords[3]))
 
         if train:
             print("Generating train set")
@@ -73,16 +87,19 @@ class climexSet(Dataset):
                 files.append(glob.glob("{path}/*_{var}_*_{year}_*".format(path=datadir, var=var, year=year))[0])    
 
         # Importing all NetCDF files into a xarray Dataset with lazy loading and chunking
-        self.data = xr.open_mfdataset(paths=files, chunks={"time":100, "rlon": 100, "rlat":100}, data_vars="minimal", coords="minimal", compat="override")#[self.variables]
-
+        self.data = xr.open_mfdataset(paths=files, engine='h5netcdf', preprocess=select_coords, data_vars="minimal", coords="minimal", compat="override", parallel=True)[self.variables].chunk({"time": self.chunksize, "rlon": self.width, "rlat": self.height})
+        
         # Extracting latitude and longitude data (for plotting function)
-        self.lon = self.data.isel(rlon=range(coords[0], coords[1]), rlat=range(coords[2],coords[3])).lon
-        self.lat = self.data.isel(rlon=range(coords[0], coords[1]), rlat=range(coords[2],coords[3])).lat
+        self.lon = self.data.lon
+        self.lat = self.data.lat
+
+        self.data = self.data.to_array()
 
         print("Imported all data files into xarray Dataset using lazy loading")
 
         # Loading into memory high-resolution ground-truth data from desired spatial window and converting to Pytorch tensor (time, nvar, height, width)
-        self.hr = torch.tensor(self.data.isel(rlon=slice(coords[0], coords[1]), rlat=slice(coords[2],coords[3]))[self.variables].load().to_array().to_numpy()).transpose(0,1)
+        self.data.load()
+        self.hr = torch.from_numpy(self.data.data).transpose(0,1)
 
         print("Loaded dataset into memory")
 
