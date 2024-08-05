@@ -14,8 +14,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
-from memory_profiler import profile
-
 #####
 
 # Converts np.datetime64 to np.float64 (number of days to date)
