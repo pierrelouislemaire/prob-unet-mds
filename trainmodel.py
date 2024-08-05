@@ -31,7 +31,7 @@ def get_args():
 
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=1)
+    parser.add_argument('--num_epochs', type=int, default=15)
     parser.add_argument('--lr', type=float, default=3e-05)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
