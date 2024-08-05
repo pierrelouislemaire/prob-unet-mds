@@ -23,9 +23,9 @@ if __name__ == "__main__":
         wandb.watch(models=unet_model)
 
     # Initiliazing the training and testing dataset
-    dataset_train = cu.climexSet(args.datadir, years=args.years_train, coords=args.coords, lowres_scale=args.lowres_scale, train=True)
-    dataset_val = cu.climexSet(args.datadir, years=args.years_val, coords=args.coords, lowres_scale=args.lowres_scale, train=False, trainset=dataset_train)
-    dataset_test = cu.climexSet(args.datadir, years=args.years_test, coords=args.coords, lowres_scale=args.lowres_scale, train=False, trainset=dataset_train)
+    dataset_train = cu.climex2torch(args.datadir, years=args.years_train, coords=args.coords, lowres_scale=args.lowres_scale, train=True)
+    dataset_val = cu.climex2torch(args.datadir, years=args.years_val, coords=args.coords, lowres_scale=args.lowres_scale, train=False, trainset=dataset_train)
+    dataset_test = cu.climex2torch(args.datadir, years=args.years_test, coords=args.coords, lowres_scale=args.lowres_scale, train=False, trainset=dataset_train)
 
     # Initiliazing the dataloaders
     dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True, num_workers=4)
@@ -52,7 +52,7 @@ if __name__ == "__main__":
         val_losses.append(epoch_val_loss)
 
         # Sampling from the model every 5 epochs
-        if epoch % 1 == 0:
+        if epoch % 5 == 0:
             hr_pred, (fig, axs) = tm.sample_model(model=unet_model, dataloader=dataloader_test_random, epoch=epoch, device=args.device)
             fig.savefig(f"./{args.plotdir}/epoch{epoch}.png", dpi=300)
             plt.close(fig)
