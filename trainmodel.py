@@ -20,10 +20,10 @@ def get_args():
 
     # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
-    parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
+    parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax']) 
     parser.add_argument('--years_train', type=range, default=range(1960, 2060))
     parser.add_argument('--years_val', type=range, default=range(2060, 2080))
-    parser.add_argument('--years_test', type=range, default=range(2080, 2099))
+    parser.add_argument('--years_test', type=range, default=range(2080, 2098))
     parser.add_argument('--coords', type=list, default=[120, 184, 120, 184])
     parser.add_argument('--resolution', type=tuple, default=(64, 64))
     parser.add_argument('--lowres_scale', type=int, default=4)
@@ -31,9 +31,10 @@ def get_args():
 
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=15)
+    parser.add_argument('--num_epochs', type=int, default=3)
     parser.add_argument('--lr', type=float, default=3e-05)
     parser.add_argument('--accum', type=int, default=8)
+    parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
 
     # WandB activation 
@@ -89,7 +90,7 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
             inputs, targets = (batch['inputs'].to(device), batch['targets'].to(device))
             timestamps = batch['timestamps'].unsqueeze(dim=1).to(device)
 
-            # Performing forward pass of the unet model qnd computing loss
+            # Performing forward pass of the unet model and computing loss
             with torch.cuda.amp.autocast():
                 preds = model(inputs, class_labels=timestamps)
                 loss = loss_fn(preds, targets)
