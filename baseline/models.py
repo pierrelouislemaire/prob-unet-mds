@@ -5,7 +5,7 @@ import torch.nn as nn
 
 import climex_utils as cu
 import trainmodel as tm
-import deterministic_unet as det_unet
+import baseline.deterministic_unet as det_unet
 
 def BCSD(datatrain, datatest, epsilon=1e-9):
 
