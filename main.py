@@ -1,115 +1,149 @@
 import torch
-import wandb
-import numpy as np
 import matplotlib.pyplot as plt
+from dask.distributed import Client
 
 import climex_utils as cu
-import trainmodel as tm
-import models as mdls
-import deterministic_unet as det_unet
-
-# For plotting the smoothed training and validation losses
-def moving_average(x, w):
-    return np.convolve(x, np.ones(w), 'valid') / w
-
-# For reproducibility
-def seed_everything(seed: int):
-    import random, os
-    import numpy as np
-    import torch
-    
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
-
+import train_prob_unet_model as tm  
+from prob_unet import ProbabilisticUNet
 
 if __name__ == "__main__":
 
+    # Initialize Dask Client once
+    client = Client()
+
     # Importing all required arguments
     args = tm.get_args()
-    
-    seed_everything(42)
 
-    # Initializing WandB
-    if args.wandb:
-        wandb.init(project="prob-unet-mds", config={"model": args.ds_model, "epochs": 1}, name=f"{args.resolution}_{args.ds_model}")
+    # Adjust arguments for testing
+    args.years_train = range(1960, 2060)
+    args.years_val = range(2060, 2080)
+    args.years_test = range(2080, 2098)
+    args.coords = [120, 184, 120, 184]
+    args.resolution = (64, 64)
+    args.standardization = "perpixel"
+    args.variables = ['pr', 'tasmin', 'tasmax']
+    args.num_epochs = 2
+    args.batch_size = 8
+    args.beta = 0.01
+    args.wandb = False
 
-    # Initiliazing the training, validation and testing datasets
-    dataset_train = cu.climex2torch(args.datadir, years=args.years_train, coords=args.coords, lowres_scale=args.lowres_scale, standardization="perpixel")
-    dataset_val = cu.climex2torch(args.datadir, years=args.years_val, coords=args.coords, lowres_scale=args.lowres_scale, standardization="perpixel")
-    dataset_test = cu.climex2torch(args.datadir, years=args.years_test, coords=args.coords, lowres_scale=args.lowres_scale)
 
-    # Training chosen deep learning model or applying BCSD
-    if args.ds_model == "bcsd":
-        val_preds = mdls.BCSD(datatrain=dataset_train, datatest=dataset_val)
-        test_preds = mdls.BCSD(datatrain=dataset_train, datatest=dataset_test)
-    else:
-        if args.ds_model == "deterministic_unet":
-            model = det_unet.UNet(img_resolution=args.resolution, in_channels=len(args.variables), out_channels=len(args.variables), label_dim=0, use_diffuse=False)
-        elif args.ds_model == "linearcnn":
-            model = mdls.LinearCNN(resolution=args.resolution, in_channels=len(args.variables), ds_factor=args.lowres_scale)
+    # Initializing the Probabilistic UNet model
+    probunet_model = ProbabilisticUNet(
+        input_channels=len(args.variables),
+        num_classes=len(args.variables),
+        latent_dim=6,
+        num_filters=[64, 128, 256, 512]
+    ).to(args.device)
 
-        model.to(args.device)
-        if args.wandb:
-            wandb.watch(models=model)
+    # Initializing the datasets
+    dataset_train = cu.climex2torch(
+        datadir=args.datadir,
+        years=args.years_train,
+        variables=args.variables,
+        coords=args.coords,
+        lowres_scale=args.lowres_scale,
+        standardization=args.standardization,
+        client=client
+    )
+    dataset_val = cu.climex2torch(
+        datadir=args.datadir,
+        years=args.years_val,
+        variables=args.variables,
+        coords=args.coords,
+        lowres_scale=args.lowres_scale,
+        standardization=args.standardization,
+        client=client
+    )
+    dataset_test = cu.climex2torch(
+        datadir=args.datadir,
+        years=args.years_test,
+        variables=args.variables,
+        coords=args.coords,
+        lowres_scale=args.lowres_scale,
+        standardization=args.standardization,
+        client=client
+    )
 
-        # Initiliazing the dataloaders
-        dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=True)
-        dataloader_val = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=False)
-        dataloader_test = torch.utils.data.DataLoader(dataset_test, batch_size=args.batch_size, shuffle=False)
-        dataloader_val_random = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=True)
+    # Initializing the dataloaders
+    dataloader_train = torch.utils.data.DataLoader(
+        dataset_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0
+    )
+    dataloader_val = torch.utils.data.DataLoader(
+        dataset_val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0
+    )
+    dataloader_test = torch.utils.data.DataLoader(
+        dataset_test,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0
+    )
+    dataloader_test_random = torch.utils.data.DataLoader(
+        dataset_test,
+        batch_size=2,
+        shuffle=True,
+        num_workers=0
+    )
 
-        # Initiliazing training objects
-        scaler = torch.cuda.amp.GradScaler()
-        optimizer = args.optimizer(params=model.parameters(), lr=args.lr)
-        loss_fn = torch.nn.MSELoss()
+    # Initializing training objects
+    optimizer = args.optimizer(params=probunet_model.parameters(), lr=args.lr)
 
-        tr_losses = dict.fromkeys(args.variables, [])
-        val_losses = dict.fromkeys(args.variables, [])
-        # Looping over all epochs
-        for epoch in range(1, args.num_epochs+1):
+    tr_losses = []
+    val_losses = []
 
-            # Training for one epoch (going over all training data)
-            tr_running_losses = tm.train_step(model=model, dataloader=dataloader_train, loss_fn=loss_fn, optimizer=optimizer, scaler=scaler, epoch=epoch, num_epochs=args.num_epochs, accum=args.accum, act_wandb=args.wandb, device=args.device)
-            
-            # Evaluating the model on validation data
-            val_running_losses = tm.eval_model(model=model, dataloader=dataloader_val, loss_fn=loss_fn, reconstruct=False, wandb=args.wandb, device=args.device)
+    # Training loop
+    for epoch in range(1, args.num_epochs + 1):
+        # Training for one epoch
+        epoch_tr_loss = tm.train_probunet_step(
+            model=probunet_model,
+            dataloader=dataloader_train,
+            optimizer=optimizer,
+            epoch=epoch,
+            num_epochs=args.num_epochs,
+            accum=args.accum,
+            wandb_active=args.wandb,
+            device=args.device
+        )
+        tr_losses.append(epoch_tr_loss)
 
-            # Saving the training and validation losses
-            for var in args.variables:
-                tr_losses[var] = tr_losses[var] + tr_running_losses[var]
-                val_losses[var] = val_losses[var] + val_running_losses[var]
+        # Evaluating the model on validation data
+        epoch_val_loss = tm.eval_probunet_model(
+            model=probunet_model,
+            dataloader=dataloader_val,
+            wandb_active=args.wandb,
+            device=args.device
+        )
+        val_losses.append(epoch_val_loss)
 
-        # Sampling and plotting the model's predictions
-        hr_pred, (fig, axs) = tm.sample_model(model=model, dataloader=dataloader_val_random, epoch=args.num_epochs, device=args.device)
-        fig.savefig(f"./{args.plotdir}/epoch{epoch}_samples_from_{args.ds_model}.png", dpi=300)
-        plt.close(fig)
-
-        # Plotting training and validation losses
-        for var in args.variables:
-            tr_loss = moving_average(np.array(tr_losses[var]), w=24)
-            val_loss = moving_average(np.array(val_losses[var]), w=48)
-            tr_x = np.arange(1, len(tr_loss)+1)
-            val_x = np.linspace(1, len(tr_loss)+1, len(val_loss))
-            fig = plt.figure(figsize=(15,10))
-            plt.plot(tr_x, tr_loss, lw=2, label='training loss')
-            plt.plot(val_x, val_loss, lw=2, linestyle='dashed', label='validation loss')
-            plt.xlabel("Steps")
-            plt.ylabel("MAE Loss")
-            plt.title(f"MAE Loss for {var}")
-            plt.legend()
-            fig.savefig(f"./{args.plotdir}/loss_{var}.png", dpi=300)
+        # Sampling from the model every 2 epochs
+        if epoch % 2 == 0:
+            samples, (fig, axs) = tm.sample_probunet_model(
+                model=probunet_model,
+                dataloader=dataloader_test_random,
+                epoch=epoch,
+                device=args.device
+            )
+            # Save sample plots
+            fig.savefig(f"{args.plotdir}/epoch{epoch}.png", dpi=300)
             plt.close(fig)
 
-        torch.save(model.state_dict(), f"./{args.checkpoints_dir}/{args.ds_model}.pt")
-        torch.save(optimizer.state_dict(), f"./{args.checkpoints_dir}/{args.ds_model}_optimizer.pt")
+    # Plotting the training and validation losses
+    fig = plt.figure(figsize=(15, 10))
+    plt.plot(tr_losses, lw=2, label='Training Loss')
+    plt.plot(val_losses, lw=2, linestyle='dashed', label='Validation Loss')
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss")
+    plt.legend()
+    fig.savefig(f"{args.plotdir}/loss.png", dpi=300)
+    plt.close(fig)
 
-        # Evaluating the model on the validation data
-        mae_loss = tm.eval_model(model=model, dataloader=dataloader_val, loss_fn=torch.nn.L1Loss(), reconstruct=True, wandb=args.wandb, device=args.device)
-        print("MAE for precipitation on validation data: ", np.mean(mae_loss["pr"][-len(dataloader_val):]))
-        print("MAE for tasmin on validation data: ", np.mean(mae_loss["tasmin"][-len(dataloader_val):]))
-        print("MAE for tasmax on validation data: ", np.mean(mae_loss["tasmax"][-len(dataloader_val):]))
+
+    # Close the Dask Client after training is complete
+    client.close()

@@ -2,8 +2,6 @@ import os
 import warnings
 import argparse
 import torch
-import wandb
-import metrics
 import numpy as np
 
 import climex_utils as cu 
@@ -14,12 +12,10 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 def get_args():
-
     """
-    This function returns a dictionary containing all necessary arguments for importing ClimEx data, training, evaluating and sampling from a downscaling ML model.
+    This function returns a dictionary containing all necessary arguments for importing ClimEx data, training, evaluating, and sampling from a downscaling ML model.
     This function is helpful for doing sweeps and performing hyperparameter tuning.
     """
-
     parser = argparse.ArgumentParser()
 
     # climate dataset arguments
@@ -41,10 +37,8 @@ def get_args():
     parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-03)
     parser.add_argument('--accum', type=int, default=8)
+    parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
-
-    # Model evaluation arguments
-    #parser.add_argument('--metric', type=str, default="rmse", choices=["rmse", "crps", "rapsd", "mae"])
 
     # WandB activation 
     parser.add_argument('--wandb', type=bool, default=False)
@@ -52,8 +46,7 @@ def get_args():
     # GPU
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
 
-    args = parser.parse_args()
-    # saving results arguments
+    # Save results arguments
     strtime = datetime.now().strftime('%m/%d/%Y%H')
     plotdir = './results/plots/' + strtime + '/'
     parser.add_argument('--plotdir', type=str, default=plotdir)
@@ -64,10 +57,10 @@ def get_args():
     if not os.path.isdir(checkpoints_dir):
         os.makedirs(checkpoints_dir)
 
-    # Generating the dictionary
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     return args
+
 
 # Probabilistic generalization of MAE
 def crps_empirical(pred, truth):
