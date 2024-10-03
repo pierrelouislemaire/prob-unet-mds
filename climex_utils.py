@@ -45,7 +45,7 @@ class climex2torch(Dataset):
     climex2torch object can be fed to a Pytorch Dataloader.
     """
 
-    def __init__(self, datadir, years=range(1960, 2020), variables=["pr", "tasmin", "tasmax"], coords=[120, 184, 120, 184], lowres_scale = 4, time_transform=None, standardization="perpixel"):
+    def __init__(self, datadir, years=range(1960, 2020), variables=["pr", "tasmin", "tasmax"], coords=[120, 184, 120, 184], lowres_scale = 4, time_transform=None, standardization="perpixel", client=None):
 
         """
         datadir: (str) path to the directory containing NetCDF files;
@@ -58,9 +58,6 @@ class climex2torch(Dataset):
         """
 
         super().__init__()
-
-        # Setup dask distributed cluster
-        client = Client()
 
         self.datadir = datadir
         self.years = years
@@ -108,7 +105,9 @@ class climex2torch(Dataset):
         #self.hr[:, 0, :, :] = torch.log(self.hr[:, 0, :, :] + 1)
         #self.hr[:, 2, :, :] = torch.log(self.hr[:, 2, :, :] - self.hr[:, 1, :, :] + 1)
 
-        client.close()
+        # Close the Dask client if provided
+        if client is not None:
+            client.close()
 
         print("")
         print("##########################################")
@@ -356,6 +355,157 @@ class climex2torch(Dataset):
             axs[j][0, 3].set_title("Absolute error", fontsize=14)
 
         fig.suptitle("Predictions after the " + str(epoch) + "th epoch for " + str(N) + " random test dates", fontsize=18, fontweight='bold')
+
+        plt.show()
+
+        return fig, axs
+
+
+    def plot_sample_batch(self, lrinterp, hr_preds, hr, timestamps, epoch, N=2, num_samples=3):
+
+        """
+        Plots low-resolution inputs, multiple high-resolution predictions, and ground truth high-resolution outputs.
+
+        Parameters:
+        - lrinterp (torch.Tensor): Interpolated low-resolution inputs of shape [N, nvars, H, W].
+        - hr_preds (torch.Tensor): Predicted high-resolution outputs of shape [N, num_samples, nvars, H, W].
+        - hr (torch.Tensor): Ground truth high-resolution outputs of shape [N, nvars, H, W].
+        - timestamps (torch.Tensor): Timestamps corresponding to each sample.
+        - epoch (int): Current epoch number, used for plot titles.
+        - N (int): Number of samples to plot (default is 2).
+        - num_samples (int): Number of high-resolution predictions per input (default is 3).
+
+        Returns:
+        - fig: The matplotlib figure object containing the plots.
+        - axs: The axes of the plots for further customization if needed.
+        """
+
+        # Initialize projections
+        rotatedpole_prj = ccrs.RotatedPole(pole_longitude=83.0, pole_latitude=42.5)
+        platecarree_proj = ccrs.PlateCarree()
+
+        # Total columns: low-res input + predicted high-res (num_samples) + ground truth high-res
+        total_cols = num_samples + 2  # 1 (low-res) + num_samples (predictions) + 1 (ground truth)
+
+        # Initialize figure and subfigures
+        fig = plt.figure(figsize=(total_cols * 6, N * self.nvars * 4), constrained_layout=True)
+        subfigs = fig.subfigures(N, 1, hspace=0.1)
+
+        # Ensure subfigs is iterable
+        if N == 1:
+            subfigs = [subfigs]
+
+        # Define colormaps
+        prep_colors = [
+            (1., 1., 1.), 
+            (0.5, 0.88, 1.),
+            (0.1, 0.15, 0.8),
+            (0.39, 0.09, 0.66), 
+            (0.85, 0.36, 0.14),
+            (0.99, 0.91, 0.3)
+        ]
+        prep_colormap = mpl.colors.LinearSegmentedColormap.from_list(name="prep", colors=prep_colors)
+        cmaps = {'pr': prep_colormap, 'temp': cm.get_cmap('RdBu_r')}
+
+        # Loop over each low-resolution input
+        for j in range(N):
+            # Create subplots for each variable and column
+            axs = subfigs[j].subplots(self.nvars, total_cols, subplot_kw={'projection': rotatedpole_prj})
+
+            # Ensure axs is a 2D array
+            if self.nvars == 1:
+                axs = np.array([axs])
+            elif self.nvars > 1 and total_cols == 1:
+                axs = axs[:, np.newaxis]
+            else:
+                axs = np.array(axs)
+
+            # Extract latitude and longitude data
+            lat = self.lat.sel(time=str(float_to_date(timestamps[j]))[:10]).load().to_numpy().squeeze()
+            lon = self.lon.sel(time=str(float_to_date(timestamps[j]))[:10]).load().to_numpy().squeeze()
+
+            temp_max_abs = []
+            temp_ims = []
+            # Loop over variables
+            for i in range(self.nvars):
+                var = self.variables[i]
+
+                if var == "pr":
+                    cmap = cmaps["pr"]
+                    unit = " (mm/day)"
+                    # Process data
+                    lr_sample = kgm2sTommday(lrinterp[j, i])
+                    hr_sample = kgm2sTommday(hr[j, i])
+                    hr_pred_samples = [kgm2sTommday(hr_preds[j, s, i]) for s in range(num_samples)]
+
+                    vmin = 0
+                    vmax = max(torch.amax(lr_sample), torch.amax(hr_sample), max(torch.amax(pred) for pred in hr_pred_samples))
+
+                    # Plot low-resolution input
+                    axs[i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[i, 0].set_title("Low-resolution", fontsize=14)
+                    # Plot predictions
+                    for s in range(num_samples):
+                        axs[i, s+1].pcolormesh(lon, lat, hr_pred_samples[s], cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                        axs[i, s+1].set_title(f"Prediction {s+1}", fontsize=14)
+                    # Plot ground truth
+                    im = axs[i, -1].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[i, -1].set_title("High-resolution", fontsize=14)
+                    # Add colorbar
+                    cbar = plt.colorbar(im, ax=axs[i, :], orientation='vertical', shrink=0.8, extend="max")
+                    cbar.set_label(var + unit, fontsize=14)
+
+                else:  # 'tasmin' or 'tasmax'
+                    cmap = cmaps["temp"]
+                    unit = " (°C)"
+                    # Process data
+                    lr_sample = KToC(lrinterp[j, i])
+                    hr_sample = KToC(hr[j, i])
+                    hr_pred_samples = [KToC(hr_preds[j, s, i]) for s in range(num_samples)]
+
+                    max_abs = max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.abs(hr_sample)),
+                                max(torch.amax(torch.abs(pred)) for pred in hr_pred_samples))
+                    temp_max_abs.append(max_abs)
+
+                    # Plot low-resolution input
+                    axs[i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=-max_abs, vmax=max_abs, transform=platecarree_proj)
+                    axs[i, 0].set_title("Low-resolution", fontsize=14)
+                    # Plot predictions
+                    for s in range(num_samples):
+                        axs[i, s+1].pcolormesh(lon, lat, hr_pred_samples[s], cmap=cmap, vmin=-max_abs, vmax=max_abs, transform=platecarree_proj)
+                        axs[i, s+1].set_title(f"Prediction {s+1}", fontsize=14)
+                    # Plot ground truth
+                    im = axs[i, -1].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=-max_abs, vmax=max_abs, transform=platecarree_proj)
+                    axs[i, -1].set_title("High-resolution", fontsize=14)
+                    # Add colorbar
+                    cbar = plt.colorbar(im, ax=axs[i, :], orientation='vertical', shrink=0.8, extend="both")
+                    cbar.set_label(var + unit, fontsize=14)
+                    temp_ims.append(im)
+
+                # Add coastlines and gridlines
+                for l in range(total_cols):
+                    axs[i, l].coastlines()
+                    gl = axs[i, l].gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    if l > 0:
+                        gl.left_labels = False
+
+            # Adjust temperature colormaps to have shared limits
+            if temp_max_abs:
+                shared_max_abs = np.max(temp_max_abs)
+                for im in temp_ims:
+                    im.set_clim(vmin=-shared_max_abs, vmax=shared_max_abs)
+
+            # Set row titles
+            for i in range(self.nvars):
+                axs[i, 0].set_ylabel(f"{self.variables[i]}", fontsize=14)
+
+            # Set supertitle for the sample
+            subfigs[j].suptitle(f"Sample {j+1}: {str(float_to_date(timestamps[j]))[:10]}", fontsize=16)
+
+        # Set overall figure title
+        fig.suptitle(f"Predictions after the {epoch}th epoch", fontsize=18, fontweight='bold')
 
         plt.show()
 
