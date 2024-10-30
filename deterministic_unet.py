@@ -226,7 +226,7 @@ class UNet(torch.nn.Module):
         img_resolution,                     # Image resolution at input/output.
         in_channels,                        # Number of color channels at input.
         out_channels,                       # Number of color channels at output.
-        label_dim           = 0,            # Number of class labels, 0 = unconditional.
+        label_dim           = 1,            # Number of class labels, 0 = unconditional.
         augment_dim         = 0,            # Augmentation label dimensionality, 0 = no augmentation.
 
         model_channels      = 64,          # Base multiplier for the number of
@@ -237,7 +237,7 @@ class UNet(torch.nn.Module):
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
         dropout             = 0.10,         # List of resolutions with self-attention.
         label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
-        use_diffuse = True                  # Use Unet for diffusion
+        use_diffuse = False                  # Use Unet for diffusion
     ):
         super().__init__()
         self.label_dropout = label_dropout
@@ -295,12 +295,12 @@ class UNet(torch.nn.Module):
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels=None, class_labels=None,
+    def forward(self, x, t=None, noise_labels=None,
                 augment_labels=None):
         # Mapping.
         emb = torch.zeros([1, self.map_layer1.in_features], device=x.device)
         if self.map_label is not None:
-            tmp = class_labels
+            tmp = t
             if self.training and self.label_dropout:
                 tmp = tmp * (torch.rand([x.shape[0], 1],
                                         device=x.device) >= self.label_dropout).to(
@@ -328,6 +328,7 @@ class UNet(torch.nn.Module):
                 x = torch.cat([x, skips.pop()], dim=1)
             x = block(x, emb)
         x = self.out_conv(silu(self.out_norm(x)))
+
         return x
 
 #----------------------------------------------------------------------------

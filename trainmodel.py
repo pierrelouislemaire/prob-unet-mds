@@ -25,21 +25,23 @@ def get_args():
     # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
     parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
-    parser.add_argument('--years_train', type=range, default=range(1960, 2020))
-    parser.add_argument('--years_val', type=range, default=range(2020, 2040))
-    parser.add_argument('--years_test', type=range, default=range(2040, 2060))
-    parser.add_argument('--coords', type=list, default=[120, 184, 120, 184])
-    parser.add_argument('--resolution', type=tuple, default=(64, 64))
-    parser.add_argument('--lowres_scale', type=int, default=8)
+    parser.add_argument('--years_train', type=range, default=range(1990, 2020))
+    parser.add_argument('--years_val', type=range, default=range(2020, 2025))
+    parser.add_argument('--years_test', type=range, default=range(2025, 2030))
+    parser.add_argument('--coords', type=list, default=[80, 208, 100, 228])
+    parser.add_argument('--resolution', type=tuple, default=(128, 128))
+    parser.add_argument('--lowres_scale', type=int, default=4)
     parser.add_argument('--timetransform', type=str, default='id', choices=['id', 'cyclic'])
 
     # Downscaling method 
     parser.add_argument('--ds_model', type=str, default='deterministic_unet', choices=['deterministic_unet', 'probabilistic_unet', 'vae', 'linearcnn', 'bcsd'])
 
     # ML training arguments
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=10)
-    parser.add_argument('--lr', type=float, default=1e-03)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_epochs', type=int, default=30)
+    parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--min_delta', type=float, default=5e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
 
@@ -122,8 +124,34 @@ class CRPSLoss(torch.nn.Module):
 
     def forward(self, pred, truth):
         return crps_empirical(pred, truth)
+    
+class CI_MSELoss(torch.nn.Module):
+    def __init__(self):
+        super(CI_MSELoss, self).__init__()
 
-def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs, accum, act_wandb, device):
+    def forward(self, pred, truth):
+        return torch.nn.functional.mse_loss(pred, truth) + torch.nn.functional.mse_loss(pred.mean(dim=(-2,-1)), truth.mean(dim=(-2,-1)))
+    
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float('inf')
+
+    def early_stop(self, validation_loss, model):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            torch.save(model.state_dict(), f"./last_best_model_hr.pt")
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                model.load_state_dict(torch.load(f"./last_best_model_hr.pt"))
+                return True, model
+        return False, model
+
+def train_step(model, dataloader, loss_fn, optimizer, epoch, device):
 
     """
     Function for training the UNet model for a single epoch.
@@ -132,11 +160,7 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
     dataloader: torch training dataloader
     loss_fn: loss function
     optimizer: torch optimizer 
-    scaler: scaler for mixed precision training
     epoch: current epoch
-    num_epochs: total number of epochs
-    accum: number of steps to accumulate gradients over
-    wandb: True if wandb activated
     device: device to use (GPU)
 
     return -> average loss value over the epoch
@@ -146,9 +170,9 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
 
     # Activating progress bar
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
-        tq.set_description(f'Train :: Epoch: {epoch}/{num_epochs}')
+        tq.set_description(f'Train :: Epoch: {epoch}')
 
-        running_losses = dict.fromkeys(["pr", "tasmin", "tasmax"], [])
+        running_losses = {var: [] for var in ["pr", "tasmin", "tasmax"]}
         running_loss = []
         # Looping over the entire dataloader set
         for i, batch in enumerate(dataloader):
@@ -161,40 +185,17 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
             timestamps = batch['timestamps'].unsqueeze(dim=1).to(device)
 
             # Performing forward pass and computing loss
-            preds = model(inputs, class_labels=timestamps)
+            preds = model(inputs, timestamps)
             loss = loss_fn(preds, targets)
 
             # Backward pass
             loss.backward()
             optimizer.step()
 
-            """
-            UNCOMMENT FOR MIXED PRECISION TRAINING
-
-            # Performing forward pass of the unet model and computing loss
-            with torch.cuda.amp.autocast():
-                preds = model(inputs, class_labels=timestamps)
-                loss = loss_fn(preds, targets)
-
-            # Logging training loss in wandb
-            if act_wandb:
-                wandb.log(data={"train-loss": loss.item()})
-
-            # Performing backprograpation
-            scaler.scale(loss).backward()
-
-            # Updating optimizer every accum steps
-            if (i + 1) % accum == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-
-            """
-
             # Logging per-variable training losses
-            loss_pr = loss_fn(preds[:,0,:,:], targets[:,0,:,:])
-            loss_tasmin = loss_fn(preds[:,1,:,:], targets[:,1,:,:])
-            loss_tasmax = loss_fn(preds[:,2,:,:], targets[:,2,:,:])
+            loss_pr = torch.nn.L1Loss()(preds[:,0,:,:], targets[:,0,:,:])
+            loss_tasmin = torch.nn.L1Loss()(preds[:,1,:,:], targets[:,1,:,:])
+            loss_tasmax = torch.nn.L1Loss()(preds[:,2,:,:], targets[:,2,:,:])
 
             running_losses['pr'] = running_losses['pr'] + [loss_pr.item()]
             running_losses['tasmin'] = running_losses['tasmin'] + [loss_tasmin.item()]
@@ -205,6 +206,10 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
 
         mean_loss = sum(running_loss) / len(running_loss)
         tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')
+
+        running_losses['pr'] = sum(running_losses['pr']) / len(running_losses['pr'])
+        running_losses['tasmin'] = sum(running_losses['tasmin']) / len(running_losses['tasmin'])
+        running_losses['tasmax'] = sum(running_losses['tasmax']) / len(running_losses['tasmax'])
 
         return running_losses
 
@@ -223,33 +228,38 @@ def sample_model(model, dataloader, epoch, device):
     """
 
     model.eval()
-
-    # Extracting data from the first batch of the dataloader
     batch = next(iter(dataloader))
-    inputs, lrinterp, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps'], batch['stand_stats'])
 
-    # Performing forward pass on the unet
-    residual_preds = model(inputs, class_labels=timestamps.unsqueeze(dim=1).to(device))
-
-    # Converting predicted residual to high-resolution sample
-    hr_pred = dataloader.dataset.residual_to_hr(residual_preds.detach().cpu(), lrinterp, stand_stats)
-
-    # Plotting the results
-    fig, axs = dataloader.dataset.plot_batch(lrinterp, hr_pred, hr, timestamps, epoch)
+    if dataloader.dataset.type == "lr_to_hr":
+        inputs, lr, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lr'], batch['hr'], batch['timestamps_float'], batch['stand_stats'])
+        preds = model(inputs, batch["timestamps"].unsqueeze(dim=1).to(device))
+        hr_pred = dataloader.dataset.invstand_residual(preds.detach().cpu(), stand_stats)
+        fig, axs = dataloader.dataset.plot_batch(torch.nn.functional.interpolate(lr, size=hr.size()[-2:]), hr_pred, hr, timestamps, epoch)
+    elif dataloader.dataset.type == "lrinterp_to_hr":
+        inputs, lrinterp, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'], batch['stand_stats'])
+        preds = model(inputs, batch["timestamps"].unsqueeze(dim=1).to(device))
+        hr_pred = dataloader.dataset.invstand_residual(preds.detach().cpu(), stand_stats)
+        fig, axs = dataloader.dataset.plot_batch(lrinterp, hr_pred, hr, timestamps, epoch)
+    elif dataloader.dataset.type == "lrinterp_to_residuals" or dataloader.dataset.type == "lr_to_residuals":
+        inputs, lrinterp, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'], batch['stand_stats'])
+        preds = model(inputs, batch["timestamps"].unsqueeze(dim=1).to(device))
+        hr_pred = dataloader.dataset.residual_to_hr(preds.detach().cpu(), lrinterp, stand_stats)
+        fig, axs = dataloader.dataset.plot_batch(lrinterp, hr_pred, hr, timestamps, epoch)
 
     return hr_pred, (fig, axs)
 
 @torch.no_grad()
-def eval_model(model, dataloader, loss_fn, reconstruct, wandb, device):
+def eval_model(model, dataloader, loss_fn, reconstruct, device, transfo=False):
 
     """
     Function for evaluating the unet model.
 
     model: instance of the Unet class
     dataloader: torch dataloader 
-    metric: metric used for evaluation
-    wandb: True if wandb activated
+    loss_fn: metric used for evaluation
+    reconstruct: if true the loss is computed on the high-resolution data
     device: device to use (GPU)
+    transfo: if true, inverse transform the data before computing the loss
 
     return -> averaged loss over the dataloader set
     """
@@ -260,37 +270,42 @@ def eval_model(model, dataloader, loss_fn, reconstruct, wandb, device):
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
         tq.set_description(':: Evaluation ::')
 
-        running_losses = dict.fromkeys(["pr", "tasmin", "tasmax"], [])
+        running_losses = {var: [] for var in ["pr", "tasmin", "tasmax"]}
         # Looping over the entire dataloader set
         for i, batch in enumerate(dataloader):
             tq.update(1)
 
             # Extracting training data from batch and performing forward pass
             inputs, targets, timestamps, hr = (batch['inputs'].to(device), batch['targets'].to(device), batch['timestamps'], batch['hr'])
-            residual_preds = model(inputs, class_labels=timestamps.unsqueeze(dim=1).to(device))
+            preds = model(inputs, timestamps.unsqueeze(dim=1).to(device))
 
             # if we want to compute the loss on the high-resolution data
             if reconstruct:
 
-                preds = dataloader.dataset.residual_to_hr(residual_preds.detach().cpu(), batch['lrinterp'], batch['stand_stats'])
-                
-                preds_hr = cu.kgm2sTommday(preds[:, 0, :, :])
-                preds_tasmin = cu.KToC(preds[:, 1, :, :])
-                preds_tasmax = cu.KToC(preds[:, 2, :, :])
-                #preds_hr = cu.kgm2sTommday(cu.log_inv(preds[:, 0, :, :]))
-                #preds_tasmin = cu.KToC(preds[:, 1, :, :])
-                #preds_tasmax = cu.KToC(cu.log_inv(preds[:, 2, :, :]) + preds[:, 1, :, :])
+                if dataloader.dataset.type == "lr_to_hr" or dataloader.dataset.type == "lrinterp_to_hr":
+                    hr_preds = dataloader.dataset.invstand_residual(preds.detach().cpu(), batch['stand_stats'])
+                elif dataloader.dataset.type == "lrinterp_to_residuals" or dataloader.dataset.type == "lr_to_residuals":
+                    hr_preds = dataloader.dataset.residual_to_hr(preds.detach().cpu(), batch["lrinterp"], batch['stand_stats'])
+
+                preds_hr = cu.kgm2sTommday(hr_preds[:, 0, :, :])
+                preds_tasmin = cu.KToC(hr_preds[:, 1, :, :])
+                preds_tasmax = cu.KToC(hr_preds[:, 2, :, :])
+                if transfo:
+                    preds_hr = cu.kgm2sTommday(cu.softplus_inv(preds[:, 0, :, :]))
+                    preds_tasmin = cu.KToC(preds[:, 1, :, :])
+                    preds_tasmax = cu.KToC(hr_preds[:, 2, :, :] + hr_preds[:, 1, :, :])
 
                 hr_pr = cu.kgm2sTommday(hr[:, 0, :, :])
                 hr_tasmin = cu.KToC(hr[:, 1, :, :])
                 hr_tasmax = cu.KToC(hr[:, 2, :, :])
-                #hr_pr = cu.kgm2sTommday(cu.log_inv(hr[:, 0, :, :]))
-                #hr_tasmin = cu.KToC(hr[:, 1, :, :])
-                #hr_tasmax = cu.KToC(cu.log_inv(hr[:, 2, :, :]) + hr[:, 1, :, :])
+                if transfo:
+                    hr_pr = cu.kgm2sTommday(cu.softplus_inv(hr[:, 0, :, :]))
+                    hr_tasmin = cu.KToC(hr[:, 1, :, :])
+                    hr_tasmax = cu.KToC(hr[:, 2, :, :] + hr[:, 1, :, :])
 
-                loss_pr = loss_fn(preds_hr, hr_pr)
-                loss_tasmin = loss_fn(preds_tasmin, hr_tasmin)
-                loss_tasmax = loss_fn(preds_tasmax, hr_tasmax)
+                loss_pr = torch.nn.L1Loss()(preds_hr, hr_pr)
+                loss_tasmin = torch.nn.L1Loss()(preds_tasmin, hr_tasmin)
+                loss_tasmax = torch.nn.L1Loss()(preds_tasmax, hr_tasmax)
 
                 running_losses['pr'] = running_losses['pr'] + [loss_pr.item()]
                 running_losses['tasmin'] = running_losses['tasmin'] + [loss_tasmin.item()]
@@ -299,13 +314,16 @@ def eval_model(model, dataloader, loss_fn, reconstruct, wandb, device):
             # if we want to compute the loss directly on the residual
             else:
 
-                # Reconstructing predictions to high-resolution
-                loss_pr = loss_fn(residual_preds[:,0,:,:], targets[:,0,:,:])
-                loss_tasmin = loss_fn(residual_preds[:,1,:,:], targets[:,1,:,:])
-                loss_tasmax = loss_fn(residual_preds[:,2,:,:], targets[:,2,:,:])
+                loss_pr = torch.nn.L1Loss()(preds[:,0,:,:], targets[:,0,:,:])
+                loss_tasmin = torch.nn.L1Loss()(preds[:,1,:,:], targets[:,1,:,:])
+                loss_tasmax = torch.nn.L1Loss()(preds[:,2,:,:], targets[:,2,:,:])
 
                 running_losses['pr'] = running_losses['pr'] + [loss_pr.item()]
                 running_losses['tasmin'] = running_losses['tasmin'] + [loss_tasmin.item()]
                 running_losses['tasmax'] = running_losses['tasmax'] + [loss_tasmax.item()]
 
-    return running_losses
+        running_losses['pr'] = sum(running_losses['pr']) / len(running_losses['pr'])
+        running_losses['tasmin'] = sum(running_losses['tasmin']) / len(running_losses['tasmin'])
+        running_losses['tasmax'] = sum(running_losses['tasmax']) / len(running_losses['tasmax'])
+
+        return running_losses
