@@ -1,15 +1,11 @@
-import os
 import warnings
 import argparse
+from tqdm import tqdm
+
 import torch
-import wandb
-import metrics
 import numpy as np
 
 import climex_utils as cu 
-
-from tqdm import tqdm
-from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
@@ -25,12 +21,14 @@ def get_args():
     # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
     parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
-    parser.add_argument('--years_train', type=range, default=range(1990, 2020))
-    parser.add_argument('--years_val', type=range, default=range(2020, 2025))
-    parser.add_argument('--years_test', type=range, default=range(2025, 2030))
+    parser.add_argument('--years_train', type=range, default=range(1960, 1990))
+    parser.add_argument('--years_subtrain', type=range, default=range(1960, 1980))
+    parser.add_argument('--years_earlystop', type=range, default=range(1980, 1990))
+    parser.add_argument('--years_val', type=range, default=range(1990, 1998))
+    parser.add_argument('--years_test', type=range, default=range(1998, 2006))
     parser.add_argument('--coords', type=list, default=[80, 208, 100, 228])
     parser.add_argument('--resolution', type=tuple, default=(128, 128))
-    parser.add_argument('--lowres_scale', type=int, default=4)
+    parser.add_argument('--lowres_scale', type=int, default=16)
     parser.add_argument('--timetransform', type=str, default='id', choices=['id', 'cyclic'])
 
     # Downscaling method 
@@ -39,8 +37,8 @@ def get_args():
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=30)
-    parser.add_argument('--patience', type=int, default=5)
-    parser.add_argument('--min_delta', type=float, default=5e-4)
+    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--min_delta', type=float, default=0)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
@@ -54,7 +52,9 @@ def get_args():
     # GPU
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
 
-    args = parser.parse_args()
+    """
+
+    args, _ = parser.parse_known_args()
     # saving results arguments
     strtime = datetime.now().strftime('%m/%d/%Y%H')
     plotdir = './results/plots/' + strtime + '/'
@@ -66,73 +66,19 @@ def get_args():
     if not os.path.isdir(checkpoints_dir):
         os.makedirs(checkpoints_dir)
 
+    """
+
     # Generating the dictionary
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     return args
-
-# Probabilistic generalization of MAE
-def crps_empirical(pred, truth):
-    """
-    Code borrowed from pyro: https://docs.pyro.ai/en/stable/_modules/pyro/ops/stats.html#crps_empirical
-
-    Computes negative Continuous Ranked Probability Score CRPS* [1] between a
-    set of samples ``pred`` and true data ``truth``. This uses an ``n log(n)``
-    time algorithm to compute a quantity equal that would naively have
-    complexity quadratic in the number of samples ``n``::
-
-        CRPS* = E|pred - truth| - 1/2 E|pred - pred'|
-              = (pred - truth).abs().mean(0)
-              - (pred - pred.unsqueeze(1)).abs().mean([0, 1]) / 2
-
-    Note that for a single sample this reduces to absolute error.
-
-    **References**
-
-    [1] Tilmann Gneiting, Adrian E. Raftery (2007)
-        `Strictly Proper Scoring Rules, Prediction, and Estimation`
-        https://www.stat.washington.edu/raftery/Research/PDF/Gneiting2007jasa.pdf
-
-    :param torch.Tensor pred: A set of sample predictions batched on rightmost dim.
-        This should have shape ``(num_samples,) + truth.shape``.
-    :param torch.Tensor truth: A tensor of true observations.
-    :return: A tensor of shape ``truth.shape``.
-    :rtype: torch.Tensor
-    """
-    if pred.shape[1:] != (1,) * (pred.dim() - truth.dim() - 1) + truth.shape:
-        raise ValueError(
-            "Expected pred to have one extra sample dim on left. "
-            "Actual shapes: {} versus {}".format(pred.shape, truth.shape)
-        )
-    opts = dict(device=pred.device, dtype=pred.dtype)
-    num_samples = pred.size(0)
-    if num_samples == 1:
-        return (pred[0] - truth).abs()
-
-    pred = pred.sort(dim=0).values
-    diff = pred[1:] - pred[:-1]
-    weight = torch.arange(1, num_samples, **opts) * torch.arange(
-        num_samples - 1, 0, -1, **opts
-    )
-    weight = weight.reshape(weight.shape + (1,) * (diff.dim() - 1))
-
-    return (pred - truth).abs().mean(0) - (diff * weight).sum(0) / num_samples**2
-
-class CRPSLoss(torch.nn.Module):
-    def __init__(self):
-        super(CRPSLoss, self).__init__()
-
-    def forward(self, pred, truth):
-        return crps_empirical(pred, truth)
-    
-class CI_MSELoss(torch.nn.Module):
-    def __init__(self):
-        super(CI_MSELoss, self).__init__()
-
-    def forward(self, pred, truth):
-        return torch.nn.functional.mse_loss(pred, truth) + torch.nn.functional.mse_loss(pred.mean(dim=(-2,-1)), truth.mean(dim=(-2,-1)))
     
 class EarlyStopper:
+
+    """
+    Class for early stopping in the training loop.
+    """
+
     def __init__(self, patience=1, min_delta=0):
         self.patience = patience
         self.min_delta = min_delta
@@ -140,12 +86,16 @@ class EarlyStopper:
         self.min_validation_loss = float('inf')
 
     def early_stop(self, validation_loss, model):
+
+        # if the validation loss is lower than the previous minimum, save the model as best model
         if validation_loss < self.min_validation_loss:
             self.min_validation_loss = validation_loss
             torch.save(model.state_dict(), f"./last_best_model_hr.pt")
             self.counter = 0
+
         elif validation_loss > (self.min_validation_loss + self.min_delta):
             self.counter += 1
+            # if the counter is greater than the patience, load the best model and return True to break training
             if self.counter >= self.patience:
                 model.load_state_dict(torch.load(f"./last_best_model_hr.pt"))
                 return True, model
@@ -230,26 +180,28 @@ def sample_model(model, dataloader, epoch, device):
     model.eval()
     batch = next(iter(dataloader))
 
+    # Extracting batch data, forward pass, reconstruction (transformation, denormalization, etc.) and plotting
+    # Procedure depends on the data pipeline 
     if dataloader.dataset.type == "lr_to_hr":
-        inputs, lr, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lr'], batch['hr'], batch['timestamps_float'], batch['stand_stats'])
+        inputs, lr, hr, timestamps = (batch['inputs'].to(device), batch['lr'], batch['hr'], batch['timestamps_float'])
         preds = model(inputs, batch["timestamps"].unsqueeze(dim=1).to(device))
-        hr_pred = dataloader.dataset.invstand_residual(preds.detach().cpu(), stand_stats)
+        hr_pred = dataloader.dataset.invstand_residual(preds.detach().cpu())
         fig, axs = dataloader.dataset.plot_batch(torch.nn.functional.interpolate(lr, size=hr.size()[-2:]), hr_pred, hr, timestamps, epoch)
     elif dataloader.dataset.type == "lrinterp_to_hr":
-        inputs, lrinterp, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'], batch['stand_stats'])
+        inputs, lrinterp, hr, timestamps = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'])
         preds = model(inputs, batch["timestamps"].unsqueeze(dim=1).to(device))
-        hr_pred = dataloader.dataset.invstand_residual(preds.detach().cpu(), stand_stats)
+        hr_pred = dataloader.dataset.invstand_residual(preds.detach().cpu())
         fig, axs = dataloader.dataset.plot_batch(lrinterp, hr_pred, hr, timestamps, epoch)
     elif dataloader.dataset.type == "lrinterp_to_residuals" or dataloader.dataset.type == "lr_to_residuals":
-        inputs, lrinterp, hr, timestamps, stand_stats = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'], batch['stand_stats'])
+        inputs, lrinterp, hr, timestamps = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'])
         preds = model(inputs, batch["timestamps"].unsqueeze(dim=1).to(device))
-        hr_pred = dataloader.dataset.residual_to_hr(preds.detach().cpu(), lrinterp, stand_stats)
+        hr_pred = dataloader.dataset.residual_to_hr(preds.detach().cpu(), lrinterp)
         fig, axs = dataloader.dataset.plot_batch(lrinterp, hr_pred, hr, timestamps, epoch)
 
     return hr_pred, (fig, axs)
 
 @torch.no_grad()
-def eval_model(model, dataloader, loss_fn, reconstruct, device, transfo=False):
+def eval_model(model, dataloader, reconstruct, device, transfo=False):
 
     """
     Function for evaluating the unet model.
@@ -270,7 +222,12 @@ def eval_model(model, dataloader, loss_fn, reconstruct, device, transfo=False):
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
         tq.set_description(':: Evaluation ::')
 
+        temporal = {var: [] for var in ["pr", "tasmin", "tasmax"]}
+        spatial = {var: [] for var in ["pr", "tasmin", "tasmax"]}
+        violations_count = {var: [] for var in ["pr", "temp"]}
+        violations_avg = {var: [] for var in ["pr", "temp"]}
         running_losses = {var: [] for var in ["pr", "tasmin", "tasmax"]}
+
         # Looping over the entire dataloader set
         for i, batch in enumerate(dataloader):
             tq.update(1)
@@ -282,34 +239,49 @@ def eval_model(model, dataloader, loss_fn, reconstruct, device, transfo=False):
             # if we want to compute the loss on the high-resolution data
             if reconstruct:
 
+                # reconstruct the high-resolution data
                 if dataloader.dataset.type == "lr_to_hr" or dataloader.dataset.type == "lrinterp_to_hr":
-                    hr_preds = dataloader.dataset.invstand_residual(preds.detach().cpu(), batch['stand_stats'])
+                    hr_preds = dataloader.dataset.invstand_residual(preds.detach().cpu())
                 elif dataloader.dataset.type == "lrinterp_to_residuals" or dataloader.dataset.type == "lr_to_residuals":
-                    hr_preds = dataloader.dataset.residual_to_hr(preds.detach().cpu(), batch["lrinterp"], batch['stand_stats'])
+                    hr_preds = dataloader.dataset.residual_to_hr(preds.detach().cpu(), batch["lrinterp"])
 
+                # inverse transform the data
+                if transfo:
+                    hr_preds[:, 0, :, :] = cu.softplus(hr_preds[:, 0, :, :])
+                    hr_preds[:, 2, :, :] = cu.softplus(hr_preds[:, 2, :, :], c=0.) + hr_preds[:, 1, :, :]
+                    hr[:, 0, :, :] = cu.softplus(hr[:, 0, :, :])
+                    hr[:, 2, :, :] = cu.softplus(hr[:, 2, :, :], c=0.) + hr[:, 1, :, :]
+
+                # to the original units
                 preds_hr = cu.kgm2sTommday(hr_preds[:, 0, :, :])
                 preds_tasmin = cu.KToC(hr_preds[:, 1, :, :])
                 preds_tasmax = cu.KToC(hr_preds[:, 2, :, :])
-                if transfo:
-                    preds_hr = cu.kgm2sTommday(cu.softplus_inv(preds[:, 0, :, :]))
-                    preds_tasmin = cu.KToC(preds[:, 1, :, :])
-                    preds_tasmax = cu.KToC(hr_preds[:, 2, :, :] + hr_preds[:, 1, :, :])
 
                 hr_pr = cu.kgm2sTommday(hr[:, 0, :, :])
                 hr_tasmin = cu.KToC(hr[:, 1, :, :])
                 hr_tasmax = cu.KToC(hr[:, 2, :, :])
-                if transfo:
-                    hr_pr = cu.kgm2sTommday(cu.softplus_inv(hr[:, 0, :, :]))
-                    hr_tasmin = cu.KToC(hr[:, 1, :, :])
-                    hr_tasmax = cu.KToC(hr[:, 2, :, :] + hr[:, 1, :, :])
 
-                loss_pr = torch.nn.L1Loss()(preds_hr, hr_pr)
-                loss_tasmin = torch.nn.L1Loss()(preds_tasmin, hr_tasmin)
-                loss_tasmax = torch.nn.L1Loss()(preds_tasmax, hr_tasmax)
+                # log the mae per timestamp
+                temporal["pr"].append(list(torch.abs(preds_hr - hr_pr).mean(dim=(-2,-1))))
+                temporal["tasmin"].append(list(torch.abs(preds_tasmin - hr_tasmin).mean(dim=(-2,-1))))
+                temporal["tasmax"].append(list(torch.abs(preds_tasmax - hr_tasmax).mean(dim=(-2,-1))))
 
-                running_losses['pr'] = running_losses['pr'] + [loss_pr.item()]
-                running_losses['tasmin'] = running_losses['tasmin'] + [loss_tasmin.item()]
-                running_losses['tasmax'] = running_losses['tasmax'] + [loss_tasmax.item()]
+                # log the mae per spatial point
+                spatial["pr"].append(torch.abs(preds_hr - hr_pr).mean(dim=(0)))
+                spatial["tasmin"].append(torch.abs(preds_tasmin - hr_tasmin).mean(dim=(0)))
+                spatial["tasmax"].append(torch.abs(preds_tasmax - hr_tasmax).mean(dim=(0)))
+
+                # log the number of constraint violations
+                violations_count["pr"].append(torch.sum(preds_hr < 0, dim=0))
+                violations_count["temp"].append(torch.sum(preds_tasmax < preds_tasmin, dim=0))
+
+                # log the average constraint violation
+                preds_hr[preds_hr > 0] = 0
+                preds_tasmax[preds_tasmax > preds_tasmin] = preds_tasmin[preds_tasmax > preds_tasmin]
+                constraint_error_pr = torch.sum(torch.abs(preds_hr), dim=0)
+                constraint_error_temp = torch.sum(torch.abs(preds_tasmax - preds_tasmin), dim=0)
+                violations_avg["pr"].append(constraint_error_pr)
+                violations_avg["temp"].append(constraint_error_temp)
             
             # if we want to compute the loss directly on the residual
             else:
@@ -322,8 +294,37 @@ def eval_model(model, dataloader, loss_fn, reconstruct, device, transfo=False):
                 running_losses['tasmin'] = running_losses['tasmin'] + [loss_tasmin.item()]
                 running_losses['tasmax'] = running_losses['tasmax'] + [loss_tasmax.item()]
 
-        running_losses['pr'] = sum(running_losses['pr']) / len(running_losses['pr'])
-        running_losses['tasmin'] = sum(running_losses['tasmin']) / len(running_losses['tasmin'])
-        running_losses['tasmax'] = sum(running_losses['tasmax']) / len(running_losses['tasmax'])
+        if reconstruct:
 
-        return running_losses
+            # joining the lists of mae per timestamp
+            temporal["pr"] = sum(temporal["pr"], [])
+            temporal["tasmin"] = sum(temporal["tasmin"], [])
+            temporal["tasmax"] = sum(temporal["tasmax"], [])
+
+            # averaging the mae per spatial point over the batches
+            spatial["pr"] = (np.sum(spatial["pr"], axis=0) / len(spatial["pr"])).flatten()
+            spatial["tasmin"] = (np.sum(spatial["tasmin"], axis=0) / len(spatial["tasmin"])).flatten()
+            spatial["tasmax"] = (np.sum(spatial["tasmax"], axis=0) / len(spatial["tasmax"])).flatten()
+
+            # summing the number of constraint violations over the batches
+            violations_count["pr"] = np.sum(violations_count["pr"], axis=0).flatten()
+            violations_count["temp"] = np.sum(violations_count["temp"], axis=0).flatten()
+
+            # if the number of constraint violations is 0, we set it to 1 to avoid division by 0
+            tmp_violcount_pr = violations_count['pr']
+            tmp_violcount_temp = violations_count['temp']
+            tmp_violcount_pr[tmp_violcount_pr == 0] = 1
+            tmp_violcount_temp[tmp_violcount_temp == 0] = 1
+
+            # averaging the constraint violations over the batches
+            violations_avg["pr"] = np.sum(violations_avg["pr"], axis=0).flatten() / tmp_violcount_pr
+            violations_avg["temp"] = np.sum(violations_avg["temp"], axis=0).flatten() / tmp_violcount_temp
+
+            return temporal, spatial, violations_count, violations_avg
+        
+        else: 
+            running_losses['pr'] = sum(running_losses['pr']) / len(running_losses['pr'])
+            running_losses['tasmin'] = sum(running_losses['tasmin']) / len(running_losses['tasmin'])
+            running_losses['tasmax'] = sum(running_losses['tasmax']) / len(running_losses['tasmax'])
+
+            return running_losses

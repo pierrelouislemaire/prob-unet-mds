@@ -236,7 +236,7 @@ class UNet(torch.nn.Module):
         num_blocks          = 2,            # Number of residual blocks per resolution.
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
         dropout             = 0.10,         # List of resolutions with self-attention.
-        label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+        label_dropout       = 0.1,            # Dropout probability of class labels for classifier-free guidance.
         use_diffuse = False                  # Use Unet for diffusion
     ):
         super().__init__()
@@ -249,11 +249,11 @@ class UNet(torch.nn.Module):
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=model_channels) if use_diffuse else None
         self.map_augment = Linear(in_features=augment_dim, out_features=model_channels, bias=False, **init_zero) if augment_dim else None
-        self.map_layer0 = Linear(in_features=model_channels, out_features=emb_channels, **init)
-        self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
         self.map_label = Linear(in_features=label_dim, out_features=emb_channels, bias=False, init_mode='kaiming_normal', init_weight=np.sqrt(label_dim)) if label_dim else None
 
         assert len(img_resolution) == 2
+
+        self.skips_postunet = None
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
@@ -295,8 +295,7 @@ class UNet(torch.nn.Module):
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, t=None, noise_labels=None,
-                augment_labels=None):
+    def forward(self, x, t=None):
         # Mapping.
         emb = torch.zeros([1, self.map_layer1.in_features], device=x.device)
         if self.map_label is not None:
@@ -306,21 +305,16 @@ class UNet(torch.nn.Module):
                                         device=x.device) >= self.label_dropout).to(
                     tmp.dtype)
             emb = self.map_label(tmp)
-        if self.map_noise is not None:
-            emb_n = self.map_noise(noise_labels)
-            emb_n = silu(self.map_layer0(emb_n))
-            emb_n = self.map_layer1(emb_n)
-            emb = emb + emb_n
-        if self.map_augment is not None and augment_labels is not None:
-            emb = emb + self.map_augment(augment_labels)
 
         emb = silu(emb)
+        self.emb = emb
 
         # Encoder.
         skips = []
         for block in self.enc.values():
             x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
             skips.append(x)
+            self.skips_postunet = skips[:3].copy()
 
         # Decoder.
         for block in self.dec.values():
@@ -332,60 +326,106 @@ class UNet(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
-# Improved preconditioning proposed in the paper "Elucidating the Design
-# Space of Diffusion-Based Generative Models" (EDM).
-
-class EDMPrecond(torch.nn.Module):
-    def __init__(self,
-        img_resolution,                     # Image resolution.
-        in_channels,                       # Number of color channels.
-        out_channels,                       # Number of color channels.
-        label_dim       = 0,                # Number of class labels, 0 = unconditional.
-        use_fp16        = False,            # Execute the underlying model at FP16 precision?
-        sigma_min       = 0,                # Minimum supported noise level.
-        sigma_max       = float('inf'),     # Maximum supported noise level.
-        sigma_data      = 1.0,              # Expected standard deviation of
-                 # the training data.
-        model_type      = 'UNet',   # Class name of the underlying model.
-        **model_kwargs,                     # Keyword arguments for the underlying model.
-    ):
+# Post-UNet variant with skip connections
+class postUNet_wskips(torch.nn.Module):
+    def __init__(self, img_resolution, in_channels, ds_scale, num_res_blocks, channel_mult, out_channels):
         super().__init__()
-        self.img_resolution = img_resolution
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.label_dim = label_dim
-        self.use_fp16 = use_fp16
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.sigma_data = sigma_data
-        self.model = globals()[model_type](
-            img_resolution=img_resolution, in_channels=in_channels,
-            out_channels=out_channels, label_dim=label_dim, **model_kwargs)
+        ds_head_channels_mult = np.arange(1, np.log2(ds_scale)+1)
+        base_channels = 64
+        self.core_unet = UNet(img_resolution=img_resolution, in_channels=in_channels, model_channels=base_channels,
+                              out_channels=base_channels, num_blocks=num_res_blocks, channel_mult=channel_mult)
+        self.num_res_blocks = num_res_blocks
+        self.postunet = torch.nn.ModuleList()
+        self.skips = torch.nn.ModuleList()
+        c_out = base_channels
+        emb_channels = base_channels * 4
+        for post_lvl in ds_head_channels_mult:
+            c_in = c_out
+            self.postunet.append(UNetBlock(in_channels=c_out, out_channels=c_out, emb_channels=emb_channels, up=True))
+            for i in range(num_res_blocks+1):
+                skip_channels = base_channels // 2 ** int(post_lvl)
+                c_in = c_out + skip_channels
+                c_out = base_channels // 2 ** int(post_lvl)
+                self.postunet.append(UNetBlock(in_channels=c_in, out_channels=c_out, emb_channels=emb_channels))
+                self.skips.append(Conv2d(in_channels=base_channels, out_channels=skip_channels, kernel=3))
+        self.out_norm = GroupNorm(num_channels=c_out)
+        self.out_conv = Conv2d(in_channels=c_out, out_channels=out_channels, kernel=3)
 
-    def forward(self, x, sigma, condition_img=None, class_labels=None,
-                force_fp32=True, **model_kwargs):
-        if condition_img is not None:
-            in_img = torch.cat([x, condition_img], dim=1)
-        else:
-            in_img = x
-        sigma = sigma.reshape(-1, 1, 1, 1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=in_img.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
-        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and in_img.device.type == 'cuda') else torch.float32
+    def forward(self, x, t=None):
+        orig = x
+        x = self.core_unet(x, t)
+        emb = self.core_unet.emb
+        c_skip = 1
+        lvl = 1
+        for module in self.postunet:
+            if c_skip == self.num_res_blocks+2:
+                c_skip = 1
+                lvl += 1
+            if x.shape[1] != module.in_channels:
+                skip = self.core_unet.skips_postunet[-c_skip]
+                up_skip = torch.nn.functional.interpolate(skip, scale_factor=2**lvl)
+                conv_skip = self.skips[c_skip-1+(lvl-1)*(self.num_res_blocks+1)](up_skip)
+                c_skip += 1
+                x = torch.cat([x, silu(conv_skip)], dim=1)
+            x = module(x, emb)
+        x = self.out_conv(silu(self.out_norm(x)))
 
-        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
-        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
-        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
-        c_noise = sigma.log() / 4
-
-        F_x = self.model((c_in * in_img).to(dtype),
-                         noise_labels=c_noise.flatten(),
-                         class_labels=class_labels, **model_kwargs).to(dtype)
-        assert F_x.dtype == dtype
-        D_x = c_skip * x + c_out * F_x
-        return D_x
-
-    def round_sigma(self, sigma):
-        return torch.as_tensor(sigma)
-
+        return x
+    
 #----------------------------------------------------------------------------
+# Post-UNet variant without skip connections
+class postUNet_woskips(torch.nn.Module):
+    def __init__(self, img_resolution, in_channels, ds_scale, num_res_blocks, channel_mult, out_channels):
+        super().__init__()
+        ds_head_channels_mult = np.arange(1, np.log2(ds_scale)+1)
+        base_channels = 64
+        self.core_unet = UNet(img_resolution=img_resolution, in_channels=in_channels, model_channels=base_channels,
+                              out_channels=base_channels, num_blocks=num_res_blocks, channel_mult=channel_mult)
+        self.num_res_blocks = num_res_blocks
+        self.postunet = torch.nn.ModuleList()
+        c_out = base_channels
+        emb_channels = base_channels * 4
+        for post_lvl in ds_head_channels_mult:
+            c_in = c_out
+            self.postunet.append(UNetBlock(in_channels=c_out, out_channels=c_out, emb_channels=emb_channels, up=True))
+            for i in range(num_res_blocks+1):
+                c_in = c_out
+                c_out = base_channels // 2 ** int(post_lvl)
+                self.postunet.append(UNetBlock(in_channels=c_in, out_channels=c_out, emb_channels=emb_channels))
+        self.out_norm = GroupNorm(num_channels=c_out)
+        self.out_conv = Conv2d(in_channels=c_out, out_channels=out_channels, kernel=3)
 
+    def forward(self, x, t=None):
+        x = self.core_unet(x, t)
+        emb = self.core_unet.emb
+        for module in self.postunet:
+            x = module(x, emb)
+        x = self.out_conv(silu(self.out_norm(x)))
+
+        return x
+    
+#----------------------------------------------------------------------------
+# Combining class
+class UNetAll(torch.nn.Module):
+    def __init__(self, type, img_resolution, in_channels, ds_scale, num_res_blocks, channel_mult, out_channels):
+        super().__init__()
+        if type == 'symmetric':
+            self.unet = UNet(img_resolution, in_channels, out_channels, channel_mult=channel_mult, num_blocks=num_res_blocks)
+        elif type == 'asymmetric_wskips':
+            img_resolution = (img_resolution[0] // ds_scale, img_resolution[1] // ds_scale)
+            self.unet = postUNet_wskips(img_resolution, in_channels, ds_scale, num_res_blocks, channel_mult, out_channels)
+        elif type == 'asymmetric_woskips':
+            img_resolution = (img_resolution[0] // ds_scale, img_resolution[1] // ds_scale)
+            self.unet = postUNet_woskips(img_resolution, in_channels, ds_scale, num_res_blocks, channel_mult, out_channels)
+        else:
+            raise ValueError(f'Invalid UNet type "{type}"')
+
+    def forward(self, x, t=None):
+        x = self.unet(x, t)
+        return x
+        
+if __name__ == "__main__":
+    postunet = UNetAll("assymetric_wskips", (128, 128), 3, 16, 2, [1, 2, 3, 4], 3)
+    print(sum(param.numel() for param in postunet.parameters()))
+
+        
