@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import climex_utils as cu
 import trainmodel as tm
 import baseline.models as mdls
-import baseline.deterministic_unet as det_unet
+import networks as det_unet
 
 # For plotting the smoothed training and validation losses
 def moving_average(x, w):

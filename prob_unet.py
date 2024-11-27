@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 from torch.distributions import Normal, Independent, kl
+from prob_unet_utils import init_weights
 from networks import UNet
+import numpy as np
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -41,6 +43,8 @@ class AxisAlignedConvGaussian(nn.Module):
         self.conv_mu = nn.Conv2d(num_filters[-1], latent_dim, kernel_size=1)
         self.conv_log_sigma = nn.Conv2d(num_filters[-1], latent_dim, kernel_size=1)
 
+        self.apply(init_weights)
+
     def forward(self, x, target=None):
 
         """
@@ -59,13 +63,21 @@ class AxisAlignedConvGaussian(nn.Module):
 
         # Encode the input to get the latent features
         h = self.encoder(x)
+        # print("-------------------------------------------")
+        # print("After encoder:", torch.isnan(h).any(), h.min(), h.max())
 
         # Global average pooling to get a single vector per sample
         h = torch.mean(h, dim=[2, 3], keepdim=True)
+        # print("-------------------------------------------")
+        # print("After mean pooling:", torch.isnan(h).any(), h.min(), h.max())
 
         # Compute mu and log_sigma
         mu = self.conv_mu(h)
         log_sigma = self.conv_log_sigma(h)
+        # print("-------------------------------------------")
+        # print("mu:", torch.isnan(mu).any(), mu.min(), mu.max())
+        # print("-------------------------------------------")
+        # print("log_sigma:", torch.isnan(log_sigma).any(), log_sigma.min(), log_sigma.max())
 
         # Remove the extra dimensions (height and width dimensions are 1 after pooling)
         mu = mu.squeeze(-1).squeeze(-1)
@@ -74,7 +86,7 @@ class AxisAlignedConvGaussian(nn.Module):
         # This is a multivariate normal with diagonal covariance matrix sigma
         #https://github.com/pytorch/pytorch/pull/11178
         # Create a Normal distribution with the computed parameters
-        dist = Independent(Normal(loc=mu, scale=torch.exp(log_sigma)), 1)
+        dist = Independent(Normal(loc=mu, scale=torch.exp(log_sigma) + 1e-7), 1)
         return dist
 
 class Fcomb(nn.Module):
@@ -96,6 +108,8 @@ class Fcomb(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(unet_output_channels, num_classes, kernel_size=1)
         )
+
+        self.apply(init_weights)
 
     def forward(self, feature_map, z):
 
@@ -135,10 +149,10 @@ class ProbabilisticUNet(nn.Module):
 
         # Initialize the U-Net backbone
         self.unet = UNet(
-            img_resolution=(64, 64),  
+            img_resolution=(128, 128),  
             in_channels=input_channels,
             out_channels=num_filters[0],
-            label_dim=0,
+            label_dim=1,
             use_diffuse=False
         ).to(device)
 
@@ -165,7 +179,10 @@ class ProbabilisticUNet(nn.Module):
             num_classes=num_classes
         ).to(device)
 
-    def forward(self, x, target=None, training=True):
+        # Apply Kaiming initialization to all the convolutional layers
+        # self.apply(init_weights)  # It has already been applied to the individual components
+
+    def forward(self, x, target=None, t=None, training=True):
 
         """
         Forward pass of the Probabilistic U-Net.
@@ -180,7 +197,7 @@ class ProbabilisticUNet(nn.Module):
         """
 
         # Get features from the UNet backbone      
-        unet_features = self.unet(x)
+        unet_features = self.unet(x, t)
 
         # During training, sample z from the posterior
         if training and target is not None:
@@ -195,7 +212,7 @@ class ProbabilisticUNet(nn.Module):
         output = self.fcomb(unet_features, z)
         return output
     
-    def elbo(self, x, target):
+    def elbo(self, x, target, t):
 
         """
         Computes the Evidence Lower Bound (ELBO) loss for training.
@@ -211,7 +228,7 @@ class ProbabilisticUNet(nn.Module):
         """
 
          # Get features from the UNet backbone      
-        unet_features = self.unet(x)
+        unet_features = self.unet(x, t)
 
         # Compute prior and posterior distributions
         self.prior_latent_space = self.prior(x)
@@ -223,12 +240,20 @@ class ProbabilisticUNet(nn.Module):
         # Compute the output
         output = self.fcomb(unet_features, z_posterior)
 
-        # Reconstruction loss (Mean Squared Error)
-        recon_loss = nn.MSELoss(reduction='sum')(output, target)
+        # Initialize total reconstruction loss and list for individual variable losses
+        total_recon_loss = 0
+        recon_loss_list = []
+
+        for i in range(output.shape[1]):  
+            # Compute reconstruction loss for each variable
+            recon_loss = nn.L1Loss(reduction='mean')(output[:, i, :, :], target[:, i, :, :])
+            recon_loss_list.append(recon_loss.item())  # Store individual variable loss
+        
+        total_recon_loss = nn.L1Loss()(output, target)  # Average to total loss
 
         # KL divergence between posterior and prior
-        kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space).sum()
+        kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space)
 
-        total_loss = recon_loss + self.beta * kl_div
+        total_loss = total_recon_loss + self.beta * torch.mean(kl_div)
 
-        return total_loss, recon_loss, kl_div
+        return total_loss, recon_loss_list, kl_div

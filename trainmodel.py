@@ -33,9 +33,9 @@ def get_args():
     parser.add_argument('--ds_model', type=str, default='deterministic_unet', choices=['deterministic_unet', 'probabilistic_unet', 'vae', 'linearcnn', 'bcsd'])
 
     # ML training arguments
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--num_epochs', type=int, default=10)
-    parser.add_argument('--lr', type=float, default=1e-03)
+    parser.add_argument('--lr', type=float, default=1e-04)
     parser.add_argument('--accum', type=int, default=8)
     parser.add_argument('--beta', type=float, default=1.0)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
@@ -141,7 +141,8 @@ def train_step(model, dataloader, loss_fn, optimizer, scaler, epoch, num_epochs,
     with tqdm(total=len(dataloader), dynamic_ncols=True) as tq:
         tq.set_description(f'Train :: Epoch: {epoch}/{num_epochs}')
 
-        running_losses = dict.fromkeys(["pr", "tasmin", "tasmax"], [])
+        # running_losses = dict.fromkeys(["pr", "tasmin", "tasmax"], [])
+        running_losses = {var: [] for var in ["pr", "tasmin", "tasmax"]}
         running_loss = []
         # Looping over the entire dataloader set
         for i, batch in enumerate(dataloader):

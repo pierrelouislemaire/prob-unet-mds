@@ -20,17 +20,29 @@ from torch.utils.data import Dataset
 def date_to_float(date_array):
     return date_array.values.astype(float)
 
-# Converts np.float64 to np.datetime64
-def float_to_date(float_array):
-    return np.array(float_array, dtype="datetime64[ns]")
+# # Converts np.float64 to np.datetime64
+# def float_to_date(float_array):
+#     return np.array(float_array, dtype="datetime64[ns]")
+def float_to_date(time_value):
+    # Adjust based on the units of timestamps_float
+    return np.datetime64(int(time_value), 'ns')  # If time_value is in nanoseconds
 
 # For precipitation
 def kgm2sTommday(data):
     return data*24*60*60
 
 # For inverse transformation
-def log_inv(data):
-    return torch.exp(data) - 1
+def softplus_inv(data, threshold=20., c=1e-7):
+    mask = data > threshold
+    data[mask] = data[mask]
+    data[~mask] = torch.log(torch.exp(data[~mask] + c) - 1.)
+    return data
+
+def softplus(data, threshold=20., c=1e-7):
+    mask = data > threshold
+    data[mask] = data[mask]
+    data[~mask] = torch.log(torch.exp(data[~mask]) + 1.) - c
+    return data
         
 # For temperature
 def KToC(data):
@@ -45,69 +57,86 @@ class climex2torch(Dataset):
     climex2torch object can be fed to a Pytorch Dataloader.
     """
 
-    def __init__(self, datadir, years=range(1960, 2020), variables=["pr", "tasmin", "tasmax"], coords=[120, 184, 120, 184], lowres_scale = 4, time_transform=None, standardization="perpixel", client=None):
+    def __init__(self, datadir, years=range(1960, 2020), variables=["pr", "tasmin", "tasmax"], coords=[120, 184, 120, 184], type="lr_to_hr", lowres_scale = 4, transfo=False, megafile=None):
 
         """
         datadir: (str) path to the directory containing NetCDF files;
         years: (list of int) indicates which years should climex2torch import data from;
         variables: (list of str) indicates what variables should climex2torch import data from;
-        coords: (list of int) (form: [start_rlon, end_rlon, start_rlat, end_rlat]) climex2torch will only import data from the resulting window:
+        coords: (list of int) (form: [start_rlon, end_rlon, start_rlat, end_rlat]) climex2torch will only import data from the resulting window;
+        type: (str) indicates the data pipeline to train the model on (lr_to_hr, lr_to_residuals, lrinterp_to_residuals, lrinterp_to_hr);
         lowres_scale: (int) downscaling factor;
-        time_transform: (function) embedding for the time variable;
-        standardization: (str) indicates the type of standardization to apply to the data (none, perpixel, pertimestep, minmax);
         """
 
         super().__init__()
+
+        # Setup dask distributed cluster
+        client = Client()
 
         self.datadir = datadir
         self.years = years
         self.variables = variables
         self.nvars = len(variables)
         self.coords = coords
+        self.type = type
         self.lowres_scale = lowres_scale
-        self.time_transform = time_transform
-        self.standardization = standardization
+        self.transfo = transfo
+        self.megafile = megafile
         self.epsilon = 1e-10 #used for standardization
         self.lrstats = None #used for standardization
 
         # Preprocessing function to select only desired coordinates
         def select_coords(ds):
             return ds.isel(rlon=slice(coords[0], coords[1]), rlat=slice(coords[2],coords[3]))
+        
+        if megafile is None:
 
-        # Recursively getting all NetCDF files names
-        files = []
-        for year in self.years:
-            for var in variables:
-                files.append(glob.glob("{path}/*_{var}_*_{year}_*".format(path=self.datadir, var=var, year=year))[0])  
+            # Recursively getting all NetCDF files names
+            files = []
+            for year in self.years:
+                for var in variables:
+                    files.append(glob.glob("{path}/*_{var}_*_{year}_*".format(path=self.datadir, var=var, year=year))[0])  
 
-        print("Opening and lazy loading netCDF files")  
+            print("Opening and lazy loading netCDF files")  
 
-        # Importing all NetCDF files into a xarray Dataset with lazy loading (chunking is managed by dask under the hood)
-        data = xr.open_mfdataset(paths=files, engine='h5netcdf', preprocess=select_coords, data_vars="minimal", coords="minimal", compat="override", parallel=True)[self.variables]
+            # Importing all NetCDF files into a xarray Dataset with lazy loading
+            self.data = xr.open_mfdataset(paths=files, engine='h5netcdf', preprocess=select_coords, data_vars="minimal", coords="minimal", compat="override", parallel=True)[self.variables]
+
+        else:
+
+            print("Opening and lazy loading megafile")
+            self.data = xr.open_dataset(self.megafile, engine="h5netcdf")[self.variables]
         
         # Extracting latitude and longitude data (for plotting function) and timestamps
-        self.lon = data.lon
-        self.lat = data.lat
-        self.timestamps = torch.from_numpy(date_to_float(data.indexes["time"].to_datetimeindex()))
+        self.lon = self.data.lon
+        self.lat = self.data.lat
+
+        # Extracting time features
+        time = self.data.indexes["time"].to_datetimeindex()
+        month = np.sin(2*np.pi*time.month/12)
+        day = np.cos(2*np.pi*time.day/31)
+        self.timestamps = torch.from_numpy(np.array(month + day)).float()
+        self.timestamps_float = date_to_float(time)
+
+        data_temp = self.data
 
         # Dropping unnecessary variables and encoding
-        data = data.drop_vars(["lat", "lon"]).drop_indexes(["rlon", "rlat"]).drop_encoding().to_array()
+        data_temp = data_temp.drop_vars(["lat", "lon"]).drop_indexes(["rlon", "rlat"]).drop_encoding().to_array()
 
         print("Loading dataset into memory")
-        data.load()
+        data_temp.load()
 
         print("Converting xarray Dataset to Pytorch tensor")
 
         # Loading into memory high-resolution ground-truth data from desired spatial window and converting to Pytorch tensor (time, nvar, height, width)
-        self.hr = torch.from_numpy(data.to_numpy()).transpose(0, 1)
+        self.hr = torch.from_numpy(data_temp.to_numpy()).transpose(0, 1)
 
         # Tranformations (prep > 0 and tmax > tmin)
-        #self.hr[:, 0, :, :] = torch.log(self.hr[:, 0, :, :] + 1)
-        #self.hr[:, 2, :, :] = torch.log(self.hr[:, 2, :, :] - self.hr[:, 1, :, :] + 1)
+        if self.transfo:
+            self.hr[:, 0, :, :] = softplus_inv(self.hr[:, 0, :, :])
+            self.hr[:, 2, :, :] = softplus_inv(self.hr[:, 2, :, :] - self.hr[:, 1, :, :], c=0.)
 
-        # Close the Dask client if provided
-        if client is not None:
-            client.close()
+        client.close()
 
         print("")
         print("##########################################")
@@ -121,94 +150,125 @@ class climex2torch(Dataset):
 
     def __getitem__(self, idx):
 
-        hr = self.hr[idx]
+        if self.type == "lr_to_hr":
 
-        # Low-resolution data is obtained by averaging the high-resolution data and then upsampling it
-        lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(hr)
-        lrinterp = nn.functional.interpolate(input=lr.unsqueeze(0), scale_factor=self.lowres_scale, mode="bilinear").squeeze() 
+            hr = self.hr[idx]
+            lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(self.hr[idx])
 
-        # If standardization statistics are not computed yet, compute them
-        if self.lrstats is None :
-            if self.standardization == "none":
-                lrinterp_stand = lrinterp
-                hr_stand = hr
-            else:
+            # If standardization statistics are not computed yet, compute them
+            if self.lrstats is None :
                 print("Computing statistics for standardization")
                 self.lrstats = self.compute_stats()
 
-        if self.standardization == "perpixel":
+            lr_stand = (lr - self.lrstats[0][0]) / (self.lrstats[0][1] + self.epsilon)
+            hr_stand = (hr - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon)
 
-            lrinterp_stand = (lrinterp - self.lrstats[0]) / (self.lrstats[1] + self.epsilon)
-            hr_stand = (hr - self.lrstats[0]) / (self.lrstats[1] + self.epsilon)
+            return {"inputs": lr_stand,
+                    "targets": hr_stand,
+                    "timestamps": self.timestamps[idx],
+                    "timestamps_float": self.timestamps_float[idx],
+                    "hr": hr, 
+                    "lr": lr}
+        
+        if self.type == "lr_to_residuals":
 
-        elif self.standardization == "pertimestep":
+            hr = self.hr[idx]
+            lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(self.hr[idx])
 
-            lrinterp_stand = (lrinterp - self.lrstats[0][idx]) / (self.lrstats[1][idx] + self.epsilon)
-            hr_stand = (hr - self.lrstats[0][idx]) / (self.lrstats[1][idx] + self.epsilon)
+            # If standardization statistics are not computed yet, compute them
+            if self.lrstats is None :
+                print("Computing statistics for standardization")
+                self.lrstats = self.compute_stats()
 
-        elif self.standardization == "minmax":
-    
-            lrinterp_stand = (lrinterp - self.lrstats[0][idx]) / (self.lrstats[1][idx] - self.lrstats[0][idx] + self.epsilon)
-            hr_stand = (hr - self.lrstats[0][idx]) / (self.lrstats[1][idx] - self.lrstats[0][idx] + self.epsilon)  
+            lr_stand = (lr - self.lrstats[0][0]) / (self.lrstats[0][1] + self.epsilon)
+            hr_stand = (hr - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon)
+
+            residual = hr_stand - nn.functional.interpolate(input=lr_stand.unsqueeze(0), scale_factor=self.lowres_scale).squeeze()
+
+            return {"inputs": lr_stand,
+                    "targets": residual,
+                    "timestamps": self.timestamps[idx],
+                    "timestamps_float": self.timestamps_float[idx],
+                    "hr": hr, 
+                    "lr": lr,
+                    "lrinterp": nn.functional.interpolate(input=lr.unsqueeze(0), scale_factor=self.lowres_scale).squeeze()}
+        
+        elif self.type == "lrinterp_to_residuals":
+
+            hr = self.hr[idx]
+
+            # Low-resolution data is obtained by averaging the high-resolution data and then upsampling it
+            lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(hr)
+            lrinterp = nn.functional.interpolate(input=lr.unsqueeze(0), scale_factor=self.lowres_scale).squeeze() 
+
+            # If standardization statistics are not computed yet, compute them
+            if self.lrstats is None :
+                print("Computing statistics for standardization")
+                self.lrstats = self.compute_stats()
+
+            lrinterp_stand = (lrinterp - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon)
+            hr_stand = (hr - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon)
+
+            residual = hr_stand - lrinterp_stand
+            timestamp = self.timestamps[idx]
+
+            return {"inputs": lrinterp_stand,
+                    "targets": residual,
+                    "timestamps": timestamp,
+                    "timestamps_float": self.timestamps_float[idx],
+                    "hr": hr, 
+                    "lr": lr,
+                    "lrinterp": lrinterp}
+
+        elif self.type == "lrinterp_to_hr":
+
+            hr = self.hr[idx]
+
+            # Low-resolution data is obtained by averaging the high-resolution data and then upsampling it
+            lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(hr)
+            lrinterp = nn.functional.interpolate(input=lr.unsqueeze(0), scale_factor=self.lowres_scale).squeeze() 
+
+            # If standardization statistics are not computed yet, compute them
+            if self.lrstats is None :
+                print("Computing statistics for standardization")
+                self.lrstats = self.compute_stats()
+
+            lrinterp_stand = (lrinterp - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon)
+            hr_stand = (hr - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon) 
+
+            timestamp = self.timestamps[idx]
+
+            return {"inputs": lrinterp_stand,
+                    "targets": hr_stand,
+                    "timestamps": timestamp,
+                    "timestamps_float": self.timestamps_float[idx],
+                    "hr": hr, 
+                    "lr": lr,
+                    "lrinterp": lrinterp}
 
 
-        residual = hr_stand - lrinterp_stand
-        timestamp = self.timestamps[idx]
-
-        return {"inputs": lrinterp_stand,
-                "targets": residual,
-                "timestamps": timestamp,
-                "hr": hr, 
-                "lr": lr,
-                "lrinterp": lrinterp,
-                "stand_stats": (self.lrstats[0][idx], self.lrstats[1][idx]) if (self.standardization != "perpixel" and self.standardization != "none") else 0}
-    
     # Computes the statistics of the low-resolution data for standardization
     def compute_stats(self):
 
         lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(self.hr)
 
-        # Reduce to N(0,1) each pixel
-        if self.standardization == "perpixel":
-           
-            mean, std = lr.mean(dim=0), lr.std(dim=0) 
-            # Extend the dimension to match high-resolution
-            mean_hrdim = mean.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
-            std_hrdim = std.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
+        mean, std = lr.mean(dim=0), lr.std(dim=0) 
+        # Extend the dimension to match high-resolution
+        mean_hrdim = mean.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
+        std_hrdim = std.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
 
-            return mean_hrdim, std_hrdim
-
-        # Reduce to N(0,1) each sample (along the time dimension)
-        elif self.standardization == "pertimestep":
-
-            mean, std = lr.mean(dim=(2, 3)).unsqueeze(2).unsqueeze(3), lr.std(dim=(2, 3)).unsqueeze(2).unsqueeze(3)
-
-            return mean, std
-
-        # Reduce to [0,1] each sample (along the time dimension)
-        elif self.standardization == "minmax":
-
-            min = lr.min(dim=2)[0].min(dim=2)[0].unsqueeze(2).unsqueeze(3)
-            max = lr.max(dim=2)[0].max(dim=2)[0].unsqueeze(2).unsqueeze(3)
-
-            return min, max
-
+        return (mean, std), (mean_hrdim, std_hrdim)
 
     # Computes the inverse of the standardization for the residual
-    def invstand_residual(self, standardized_residual, stand_stats):
-        if self.standardization == "perpixel":
-            return standardized_residual * (self.lrstats[1] + self.epsilon)
-        elif self.standardization == "pertimestep":
-            return standardized_residual * (stand_stats[1] + self.epsilon)
-        elif self.standardization == "minmax":
-            return standardized_residual * (stand_stats[1] - stand_stats[0] + self.epsilon)
+    def invstand_residual(self, standardized_residual):
+        if self.type == "lr_to_hr" or self.type == "lrinterp_to_hr":
+            return standardized_residual * (self.lrstats[1][1] + self.epsilon) + self.lrstats[1][0]
+        elif self.type == "lrinterp_to_residuals" or self.type == "lr_to_residuals":
+            return standardized_residual * (self.lrstats[1][1] + self.epsilon)
     
     # Adds the predicted residual to the input upsampled high-resolution
-    def residual_to_hr(self, residual, lrinterp, stand_stats):
-        if self.standardization == "none":
-            return lrinterp + residual
-        else:
-            return lrinterp + self.invstand_residual(residual, stand_stats)
+    def residual_to_hr(self, residual, lrinterp):
+        return lrinterp + self.invstand_residual(residual)
     
     # Plot a batch (N) of samples (upsampled low-resolution, predicted high-resolution, groundtruth high-resolution)
     def plot_batch(self, lrinterp, hr_pred, hr, timestamps, epoch, N=2):
@@ -253,12 +313,14 @@ class climex2torch(Dataset):
                     unit = " (mm/day)"
 
                     # Converting units in mm/day and computing scaling values for colormap
-                    #lr_sample = kgm2sTommday(log_inv(lrinterp[j,i]))
-                    #hr_pred_sample = kgm2sTommday(log_inv(hr_pred[j,i]))
-                    #hr_sample = kgm2sTommday(log_inv(hr[j,i]))
-                    lr_sample = kgm2sTommday(lrinterp[j,i])
-                    hr_pred_sample = kgm2sTommday(hr_pred[j,i])
-                    hr_sample = kgm2sTommday(hr[j,i])
+                    if self.transfo:
+                        lr_sample = kgm2sTommday(softplus(lrinterp[j,i]))
+                        hr_pred_sample = kgm2sTommday(softplus(hr_pred[j,i]))
+                        hr_sample = kgm2sTommday(softplus(hr[j,i]))
+                    else:
+                        lr_sample = kgm2sTommday(lrinterp[j,i])
+                        hr_pred_sample = kgm2sTommday(hr_pred[j,i])
+                        hr_sample = kgm2sTommday(hr[j,i])
                     vmin, vmax = 0, max(torch.amax(lr_sample), torch.amax(hr_pred_sample), torch.amax(hr_sample))
 
                     # Computing absolute error and setting corresponding vmin, vmax
@@ -299,12 +361,14 @@ class climex2torch(Dataset):
                     if self.variables[i] == "tasmin":
                         lr_sample, hr_pred_sample, hr_sample = KToC(lrinterp[j,i]), KToC(hr_pred[j,i]), KToC(hr[j,i])
                     elif self.variables[i] == "tasmax":
-                        #lr_sample = KToC(log_inv(lrinterp[j,i]) + lrinterp[j,i-1])
-                        #hr_pred_sample = KToC(log_inv(hr_pred[j,i]) + hr_pred[j,i-1])
-                        #hr_sample = KToC(log_inv(hr[j,i]) + hr[j,i-1])
-                        lr_sample = KToC(lrinterp[j,i])
-                        hr_pred_sample = KToC(hr_pred[j,i])
-                        hr_sample = KToC(hr[j,i])
+                        if self.transfo:
+                            lr_sample = KToC(softplus(lrinterp[j,i], c=0.) + lrinterp[j,i-1])
+                            hr_pred_sample = KToC(softplus(hr_pred[j,i], c=0.) + hr_pred[j,i-1])
+                            hr_sample = KToC(softplus(hr[j,i], c=0.) + hr[j,i-1])
+                        else:
+                            lr_sample = KToC(lrinterp[j,i])
+                            hr_pred_sample = KToC(hr_pred[j,i])
+                            hr_sample = KToC(hr[j,i])
                     max_abs = max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.amax(hr_pred_sample)), torch.amax(torch.amax(hr_sample)))
                     vmin, vmax = -max_abs, max_abs
 
@@ -354,14 +418,14 @@ class climex2torch(Dataset):
             axs[j][0, 2].set_title("High-resolution", fontsize=14)
             axs[j][0, 3].set_title("Absolute error", fontsize=14)
 
-        fig.suptitle("Predictions after the " + str(epoch) + "th epoch for " + str(N) + " random test dates", fontsize=18, fontweight='bold')
+        fig.suptitle("Predictions after the " + str(epoch) + "th epoch for " + str(N) + " random validation dates", fontsize=18, fontweight='bold')
 
         plt.show()
 
         return fig, axs
 
 
-    def plot_sample_batch(self, lrinterp, hr_preds, hr, timestamps, epoch, N=2, num_samples=3):
+    def plot_sample_batch(self, lrinterp, hr_preds, hr, timestamps_float, epoch, N=2, num_samples=3):
 
         """
         Plots low-resolution inputs, multiple high-resolution predictions, and ground truth high-resolution outputs.
@@ -419,10 +483,11 @@ class climex2torch(Dataset):
                 axs = axs[:, np.newaxis]
             else:
                 axs = np.array(axs)
+            
 
             # Extract latitude and longitude data
-            lat = self.lat.sel(time=str(float_to_date(timestamps[j]))[:10]).load().to_numpy().squeeze()
-            lon = self.lon.sel(time=str(float_to_date(timestamps[j]))[:10]).load().to_numpy().squeeze()
+            lat = self.lat.sel(time=str(float_to_date(timestamps_float[j].item()))[:10]).load().to_numpy().squeeze()
+            lon = self.lon.sel(time=str(float_to_date(timestamps_float[j].item()))[:10]).load().to_numpy().squeeze()
 
             temp_max_abs = []
             temp_ims = []
@@ -433,10 +498,16 @@ class climex2torch(Dataset):
                 if var == "pr":
                     cmap = cmaps["pr"]
                     unit = " (mm/day)"
-                    # Process data
-                    lr_sample = kgm2sTommday(lrinterp[j, i])
-                    hr_sample = kgm2sTommday(hr[j, i])
-                    hr_pred_samples = [kgm2sTommday(hr_preds[j, s, i]) for s in range(num_samples)]
+                    
+                    if self.transfo:
+                        lr_sample = kgm2sTommday(softplus(lrinterp[j, i]))
+                        hr_sample = kgm2sTommday(softplus(hr[j, i]))
+                        hr_pred_samples = [kgm2sTommday(softplus(hr_preds[j, s, i])) for s in range(num_samples)]
+                    else:
+                        lr_sample = kgm2sTommday(lrinterp[j, i])
+                        hr_sample = kgm2sTommday(hr[j, i])
+                        hr_pred_samples = [kgm2sTommday(hr_preds[j, s, i]) for s in range(num_samples)]
+
 
                     vmin = 0
                     vmax = max(torch.amax(lr_sample), torch.amax(hr_sample), max(torch.amax(pred) for pred in hr_pred_samples))
@@ -458,24 +529,42 @@ class climex2torch(Dataset):
                 else:  # 'tasmin' or 'tasmax'
                     cmap = cmaps["temp"]
                     unit = " (°C)"
-                    # Process data
-                    lr_sample = KToC(lrinterp[j, i])
-                    hr_sample = KToC(hr[j, i])
-                    hr_pred_samples = [KToC(hr_preds[j, s, i]) for s in range(num_samples)]
+                    if self.variables[i] == "tasmin":
+                        lr_sample = KToC(lrinterp[j, i])
+                        hr_sample = KToC(hr[j, i])
+                        hr_pred_samples = [KToC(hr_preds[j, s, i]) for s in range(num_samples)]
+                    elif self.variables[i] == "tasmax":
+                        if self.transfo:
+                            lr_sample = KToC(softplus(lrinterp[j, i], c=0.) + lrinterp[j, i-1])
+                            hr_sample = KToC(softplus(hr[j, i], c=0.) + hr[j, i-1])
+                            hr_pred_samples = [KToC(softplus(hr_preds[j, s, i], c=0.) + hr_preds[j, s, i-1]) for s in range(num_samples)]
+                        else:
+                            lr_sample = KToC(lrinterp[j, i])
+                            hr_sample = KToC(hr[j, i])
+                            hr_pred_samples = [KToC(hr_preds[j, s, i]) for s in range(num_samples)]
 
                     max_abs = max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.abs(hr_sample)),
                                 max(torch.amax(torch.abs(pred)) for pred in hr_pred_samples))
+                    
+                    vmin = -max_abs
+                    vmax = max_abs
+                    
                     temp_max_abs.append(max_abs)
 
+                    # Ensure max_abs is positive
+                    if max_abs <= 0 or np.isnan(max_abs):
+                        print(f"Invalid max_abs value: {max_abs}")
+                        max_abs = 1  # Set to a default positive value to avoid errors
+
                     # Plot low-resolution input
-                    axs[i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=-max_abs, vmax=max_abs, transform=platecarree_proj)
+                    axs[i, 0].pcolormesh(lon, lat, lr_sample, cmap=cmap, vmin=vmin, vmax=max_abs, transform=platecarree_proj)
                     axs[i, 0].set_title("Low-resolution", fontsize=14)
                     # Plot predictions
                     for s in range(num_samples):
-                        axs[i, s+1].pcolormesh(lon, lat, hr_pred_samples[s], cmap=cmap, vmin=-max_abs, vmax=max_abs, transform=platecarree_proj)
+                        axs[i, s+1].pcolormesh(lon, lat, hr_pred_samples[s], cmap=cmap, vmin=vmin, vmax=max_abs, transform=platecarree_proj)
                         axs[i, s+1].set_title(f"Prediction {s+1}", fontsize=14)
                     # Plot ground truth
-                    im = axs[i, -1].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=-max_abs, vmax=max_abs, transform=platecarree_proj)
+                    im = axs[i, -1].pcolormesh(lon, lat, hr_sample, cmap=cmap, vmin=vmin, vmax=max_abs, transform=platecarree_proj)
                     axs[i, -1].set_title("High-resolution", fontsize=14)
                     # Add colorbar
                     cbar = plt.colorbar(im, ax=axs[i, :], orientation='vertical', shrink=0.8, extend="both")
@@ -502,12 +591,10 @@ class climex2torch(Dataset):
                 axs[i, 0].set_ylabel(f"{self.variables[i]}", fontsize=14)
 
             # Set supertitle for the sample
-            subfigs[j].suptitle(f"Sample {j+1}: {str(float_to_date(timestamps[j]))[:10]}", fontsize=16)
+            subfigs[j].suptitle(f"Sample {j+1}: {str(float_to_date(timestamps_float[j].item()))[:10]}", fontsize=16)
 
         # Set overall figure title
         fig.suptitle(f"Predictions after the {epoch}th epoch", fontsize=18, fontweight='bold')
-
-        plt.show()
 
         return fig, axs
     
