@@ -140,12 +140,14 @@ class ProbabilisticUNet(nn.Module):
     The Probabilistic U-Net model combining a U-Net backbone with a variational latent space.
     """
 
-    def __init__(self, input_channels, num_classes, latent_dim=6, num_filters=[64, 128, 256, 512], beta=1.0):
+    def __init__(self, input_channels, num_classes, latent_dim=6, num_filters=[64, 128, 256, 512], beta_0 = 1.0, beta_1=1.0, beta_2=1.0):
         super(ProbabilisticUNet, self).__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
         self.latent_dim = latent_dim
-        self.beta = beta
+        self.beta_0 = beta_0
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
 
         # Initialize the U-Net backbone
         self.unet = UNet(
@@ -203,6 +205,7 @@ class ProbabilisticUNet(nn.Module):
         if training and target is not None:
             self.posterior_latent_space = self.posterior(x, target)
             z = self.posterior_latent_space.rsample()
+    
 
         # During inference, sample z from the prior
         else:
@@ -254,6 +257,18 @@ class ProbabilisticUNet(nn.Module):
         # KL divergence between posterior and prior
         kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space)
 
-        total_loss = total_recon_loss + self.beta * torch.mean(kl_div)
+        # Define the standard Gaussian distribution
+        standard_gaussian = Independent(
+            Normal(
+                loc=torch.zeros_like(self.posterior_latent_space.base_dist.loc).to(device),
+                scale=torch.ones_like(self.posterior_latent_space.base_dist.scale).to(device)
+            ),
+            1
+        )
 
-        return total_loss, recon_loss_list, kl_div
+        # KL divergence between posterior and standard Gaussian
+        kl_div2 = kl.kl_divergence(self.posterior_latent_space, standard_gaussian)
+
+        total_loss = self.beta_0 * total_recon_loss + self.beta_1 * torch.mean(kl_div) + self.beta_2 * torch.mean(kl_div2)
+
+        return total_loss, recon_loss_list, kl_div, kl_div2

@@ -30,16 +30,19 @@ def get_args():
     parser.add_argument('--years_test', type=range, default=range(1998, 2006))
     parser.add_argument('--coords', type=list, default=[80, 208, 100, 228])
     parser.add_argument('--resolution', type=tuple, default=(128, 128))
-    parser.add_argument('--lowres_scale', type=int, default=16)
+    parser.add_argument('--lowres_scale', type=int, default=8)
     parser.add_argument('--timetransform', type=str, default='id', choices=['id', 'cyclic'])
-    parser.add_argument('--beta', type=int, default=0.4)
+    parser.add_argument('--beta', type=float, default=0.0)
+    parser.add_argument('--beta_2', type=float, default=0.0)
+    parser.add_argument('--warmup_epochs', type=int, default=10, help='Number of warmup epochs for beta_2 increase')
+    parser.add_argument('--beta_2_schedule_fraction', type=float, default=1/3, help='Fraction of max_beta_2 to reach at the end of warmup')
 
     # Downscaling method 
     parser.add_argument('--ds_model', type=str, default='deterministic_unet', choices=['deterministic_unet', 'probabilistic_unet', 'vae', 'linearcnn', 'bcsd'])
 
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_epochs', type=int, default=15)
+    parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--patience', type=int, default=15)
     parser.add_argument('--min_delta', type=float, default=0)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -123,10 +126,8 @@ def train_probunet_step(model, dataloader, optimizer, epoch, num_epochs, device,
 
         running_losses_mae = {var: [] for var in variables}
         running_losses_kl = {var: [] for var in variables}
+        running_losses_kl2 = {var: [] for var in variables}
         step_losses = []
-
-        # Initialize the gradient accumulation steps counter
-        
         
         for i, batch in enumerate(dataloader):
             tq.update(1)
@@ -135,37 +136,34 @@ def train_probunet_step(model, dataloader, optimizer, epoch, num_epochs, device,
             timestamps = batch['timestamps'].unsqueeze(dim=1).to(device)
 
             
-            loss, recon_loss, kl_div = model.elbo(inputs, targets, timestamps)
-            # loss = loss / accum  # Scale the loss for gradient accumulation
+            loss, recon_loss, kl_div, kl_div2 = model.elbo(inputs, targets, timestamps)
 
             optimizer.zero_grad()  
         
             loss.backward()
-            # accelerator.backward(loss)
 
             optimizer.step()
-            # # Update optimizer after `accum` steps
-            # if (i + 1) % accum == 0 or (i + 1) == len(dataloader):
-            #     optimizer.step()
-            #     optimizer.zero_grad()
 
             # Log losses for each variable
             for idx, var in enumerate(variables):
                 var_loss = recon_loss[idx] 
                 kl_loss = kl_div[idx]
+                kl_loss2 = kl_div2[idx]
                 running_losses_mae[var].append(var_loss)
                 running_losses_kl[var].append(kl_loss)
+                running_losses_kl2[var].append(kl_loss2)
 
-            step_losses.append(loss.item()) # Store the original unscaled loss
-            tq.set_postfix_str(s=f'Loss: {loss.item():.4f}') # Unscaled loss display  
+            step_losses.append(loss.item()) 
+            tq.set_postfix_str(s=f'Loss: {loss.item():.4f}') 
         
         mean_loss = sum(step_losses) / len(step_losses)
-        tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')
+        tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')  
 
         running_losses_mae = {var: sum(running_losses_mae[var]) / len(running_losses_mae[var]) for var in variables}
         running_losses_kl = {var: sum(running_losses_kl[var]) / len(running_losses_kl[var]) for var in variables}
+        running_losses_kl2 = {var: sum(running_losses_kl2[var]) / len(running_losses_kl2[var]) for var in variables}
 
-        return running_losses_mae, running_losses_kl
+        return running_losses_mae, running_losses_kl, running_losses_kl2, kl_div, kl_div2
 
 @torch.no_grad()
 def eval_probunet_model(model, dataloader, reconstruct, device):
@@ -192,6 +190,7 @@ def eval_probunet_model(model, dataloader, reconstruct, device):
         spatial_mae = {var: [] for var in ["pr", "tasmin", "tasmax"]}
         running_losses_mae = {var: [] for var in ["pr", "tasmin", "tasmax"]}
         running_losses_kl = {var: [] for var in ["pr", "tasmin", "tasmax"]}
+        running_losses_kl2 = {var: [] for var in ["pr", "tasmin", "tasmax"]}
         step_losses = []
 
         for i, batch in enumerate(dataloader):
@@ -202,25 +201,22 @@ def eval_probunet_model(model, dataloader, reconstruct, device):
             lrinterp = batch['lrinterp']
             hr = batch['hr']
             timestamps = batch['timestamps'].unsqueeze(dim=1).to(device)
-
-            # # Use Accelerator's mixed precision autocast if provided
-            # if accelerator is not None:
-            #     with accelerator.autocast():  # Leverage mixed precision
-            #         loss, recon_loss, kl_div = model.elbo(inputs, targets)
         
-            # Normal full precision (FP32) evaluation
+
 
             if not reconstruct:
 
-                loss, recon_loss, kl_div = model.elbo(inputs, targets, timestamps)
+                loss, recon_loss, kl_div, kl_div2 = model.elbo(inputs, targets, timestamps)
                 step_losses.append(loss.item())
 
                 # Log losses for each variable
                 for idx, var in enumerate(["pr", "tasmin", "tasmax"]):
                     var_loss = recon_loss[idx] 
                     kl_loss = kl_div[idx]
+                    kl_loss2 = kl_div2[idx]
                     running_losses_mae[var].append(var_loss)
                     running_losses_kl[var].append(kl_loss)
+                    running_losses_kl2[var].append(kl_loss2)
 
             else:
 
@@ -247,8 +243,9 @@ def eval_probunet_model(model, dataloader, reconstruct, device):
 
             running_losses_mae = {var: sum(running_losses_mae[var]) / len(running_losses_mae[var]) for var in ["pr", "tasmin", "tasmax"]}
             running_losses_kl = {var: sum(running_losses_kl[var]) / len(running_losses_kl[var]) for var in ["pr", "tasmin", "tasmax"]}
+            running_losses_kl2 = {var: sum(running_losses_kl2[var]) / len(running_losses_kl2[var]) for var in ["pr", "tasmin", "tasmax"]}
 
-            return running_losses_mae, running_losses_kl
+            return running_losses_mae, running_losses_kl, running_losses_kl2
         
         else: 
 
@@ -256,27 +253,11 @@ def eval_probunet_model(model, dataloader, reconstruct, device):
             spatial_mae = {var: np.sum(spatial_mae[var], axis=0) / len(spatial_mae[var]) for var in ["pr", "tasmin", "tasmax"]}
 
             return temporal_mae, spatial_mae
-    
 
-# @torch.no_grad()
-# def plot_losses(train_losses, val_losses, variables, plotdir):
-#     """
-#     Plots the training and validation losses for each variable and saves the figure.
-#     """
-#     for var in variables:
-#         plt.figure(figsize=(10, 6))
-#         plt.plot(train_losses[var], label='Training', lw=2)
-#         plt.plot(val_losses[var], label='Validation', lw=2, linestyle='--')
-#         plt.title(f'Training and Validation Losses for {var}')
-#         plt.xlabel('Steps')
-#         plt.ylabel('Loss')
-#         plt.legend()
-#         plt.savefig(f'{plotdir}/{var}_loss.png', dpi=300)
-#         plt.close()
     
 
 @torch.no_grad()
-def sample_probunet_model(model, dataloader, epoch, device):
+def sample_probunet_model(model, dataloader, epoch, device, batch=None):
 
     """
     Generates and plots samples from the Probabilistic U-Net model.
@@ -286,13 +267,15 @@ def sample_probunet_model(model, dataloader, epoch, device):
         dataloader (torch.utils.data.DataLoader): DataLoader for the test dataset.
         epoch (int): Current epoch number (used for labeling plots).
         device (torch.device): Computation device (CPU or GPU).
+        batch: if batch is provided it uses the batch directly. If not, it takes a random batch from the dataloader.
 
     Returns:
         torch.Tensor: The generated high-resolution predictions.
     """
-        
     model.eval()
-    batch = next(iter(dataloader))
+    if batch is None:
+        batch = next(iter(dataloader))
+        
     inputs = batch['inputs'][:2].to(device)  # Select 2 random low-resolution inputs
     lrinterp = batch['lrinterp'][:2].to(device)
     hr = batch['hr'][:2].to(device)
@@ -309,15 +292,61 @@ def sample_probunet_model(model, dataloader, epoch, device):
         hr_pred = dataloader.dataset.residual_to_hr(output.cpu(), lrinterp.cpu())  # Convert residual to high-res
         hr_preds.append(hr_pred) # Append the prediction to the list
 
+
     # Stack the predictions along a new dimension to create a tensor of shape [batch_size, num_samples, channels, height, width]
     hr_preds = torch.stack(hr_preds, dim=1)  # Shape: [batch_size, num_samples, channels, height, width]
-
-    # print(f"timestamps shape: {timestamps.shape}")  
-    # print(f"timestamps value: {timestamps}") 
-    # print(f"timestamps_float: {timestamps_float}")
-    # print(f"timestamps_float shape: {timestamps_float.shape}")
 
     # Plot the generated samples using the custom plotting function
     fig, axs = dataloader.dataset.plot_sample_batch(lrinterp.cpu(), hr_preds.cpu(), hr.cpu(), timestamps_float, epoch, N=2, num_samples=num_samples)
 
     return hr_preds, (fig, axs)
+
+@torch.no_grad()
+def sample_residual_probunet_model(model, dataloader, epoch, device, batch=None):
+    """
+    Generates and plots samples from the Probabilistic U-Net model, but shows residual predictions 
+    instead of reconstructing them to high-resolution outputs.
+
+    Args:
+        model (ProbabilisticUNet): The trained Probabilistic U-Net model.
+        dataloader (torch.utils.data.DataLoader): DataLoader for the test dataset.
+        epoch (int): Current epoch number (for labeling plots).
+        device (torch.device): Computation device (CPU or GPU).
+        batch: If batch is provided, it uses the batch directly. If not, it takes a random batch from the dataloader.
+
+    Returns:
+        torch.Tensor: The generated residual predictions.
+    """
+    model.eval()
+    if batch is None:
+        batch = next(iter(dataloader))
+    
+    inputs = batch['inputs'][:2].to(device)  # Select 2 random low-resolution inputs
+    lrinterp = batch['lrinterp'][:2].to(device)
+    hr = batch['hr'][:2].to(device)
+    timestamps = batch['timestamps'][:2].unsqueeze(dim=1).to(device)
+    timestamps_float = batch['timestamps_float'][:2]
+
+    num_samples = 3  # Number of predicted outputs per input
+    residual_preds = []
+
+    for _ in range(num_samples):
+        # The model outputs residual predictions directly
+        output = model(inputs, t=timestamps, training=False)
+        residual_preds.append(output.cpu())
+
+    # Stack the predictions: shape [batch_size, num_samples, nvars, H, W]
+    residual_preds = torch.stack(residual_preds, dim=1)
+
+    # Use a new plotting function that shows residuals
+    fig, axs = dataloader.dataset.plot_residual_sample_batch(
+        lrinterp=lrinterp.cpu(),
+        residual_preds=residual_preds.cpu(),
+        hr=hr.cpu(),
+        timestamps_float=timestamps_float,
+        epoch=epoch,
+        N=2,
+        num_samples=num_samples
+    )
+
+    return residual_preds, (fig, axs)

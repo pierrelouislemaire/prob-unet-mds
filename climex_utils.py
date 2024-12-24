@@ -4,6 +4,7 @@ from dask.distributed import Client
 import xarray as xr
 import numpy as np
 import bottleneck
+import cftime
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -597,8 +598,264 @@ class climex2torch(Dataset):
         fig.suptitle(f"Predictions after the {epoch}th epoch", fontsize=18, fontweight='bold')
 
         return fig, axs
-    
 
+    def plot_residual_sample_batch(self, lrinterp, residual_preds, hr, timestamps_float, epoch, N=2, num_samples=3):
+        """
+        Plots:
+        - Low-resolution interpolated inputs (first column),
+        - Multiple residual predictions (middle columns),
+        - High-resolution ground truth outputs (last column).
+
+        Parameters:
+            lrinterp (torch.Tensor): Interpolated low-resolution inputs of shape [N, nvars, H, W].
+            residual_preds (torch.Tensor): Predicted residuals of shape [N, num_samples, nvars, H, W].
+            hr (torch.Tensor): Ground truth high-resolution outputs of shape [N, nvars, H, W].
+            timestamps_float (torch.Tensor): Float timestamps corresponding to each sample.
+            epoch (int): Current epoch number, used for plot titles.
+            N (int): Number of samples to plot (default is 2).
+            num_samples (int): Number of residual predictions per input (default is 3).
+
+        Returns:
+            fig, axs: Matplotlib figure and axes objects.
+        """
+
+        rotatedpole_prj = ccrs.RotatedPole(pole_longitude=83.0, pole_latitude=42.5)
+        platecarree_proj = ccrs.PlateCarree()
+
+        # Total columns: low-res input + predicted residuals (num_samples) + ground truth high-res
+        total_cols = num_samples + 2
+
+        fig = plt.figure(figsize=(total_cols * 6, N * self.nvars * 4), constrained_layout=True)
+        subfigs = fig.subfigures(N, 1, hspace=0.1)
+        if N == 1:
+            subfigs = [subfigs]
+
+        # Colormaps
+        prep_colors = [
+            (1., 1., 1.), 
+            (0.5, 0.88, 1.),
+            (0.1, 0.15, 0.8),
+            (0.39, 0.09, 0.66), 
+            (0.85, 0.36, 0.14),
+            (0.99, 0.91, 0.3)
+        ]
+        prep_colormap = mpl.colors.LinearSegmentedColormap.from_list(name="prep", colors=prep_colors)
+        temp_cmap = cm.get_cmap('RdBu_r')  # For temperature
+        residual_cmap = cm.get_cmap('RdBu_r')  # Diverging colormap for residuals
+
+        for j in range(N):
+            axs = subfigs[j].subplots(self.nvars, total_cols, subplot_kw={'projection': rotatedpole_prj})
+
+            if self.nvars == 1:
+                axs = np.array([axs])
+            elif self.nvars > 1 and total_cols == 1:
+                axs = axs[:, np.newaxis]
+            else:
+                axs = np.array(axs)
+
+            # Extract latitude and longitude data
+            lat = self.lat.sel(time=str(float_to_date(timestamps_float[j].item()))[:10]).load().to_numpy().squeeze()
+            lon = self.lon.sel(time=str(float_to_date(timestamps_float[j].item()))[:10]).load().to_numpy().squeeze()
+
+            for i, var in enumerate(self.variables):
+                # Transform lrinterp and hr for visualization (as in the original code)
+                if var == "pr":
+                    # Convert to mm/day
+                    if self.transfo:
+                        lr_sample = kgm2sTommday(softplus(lrinterp[j, i]))
+                        hr_sample = kgm2sTommday(softplus(hr[j, i]))
+                    else:
+                        lr_sample = kgm2sTommday(lrinterp[j, i])
+                        hr_sample = kgm2sTommday(hr[j, i])
+
+                    # Residuals are dimensionless (standardized), so just plot as is.
+                    # Determine vmin/vmax for residuals
+                    residual_var = residual_preds[j, :, i, :, :]  # shape [num_samples, H, W]
+                    max_abs_res = torch.max(torch.abs(residual_var))
+                    vmin_res, vmax_res = -max_abs_res, max_abs_res
+
+                    # Determine vmin/vmax for lr and hr
+                    vmin = 0
+                    vmax = max(torch.amax(lr_sample), torch.amax(hr_sample))
+
+                    # Plot low-res
+                    axs[i, 0].pcolormesh(lon, lat, lr_sample, cmap=prep_colormap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[i, 0].set_title("Low-resolution", fontsize=14)
+
+                    # Plot each residual prediction
+                    for s in range(num_samples):
+                        axs[i, s+1].pcolormesh(
+                            lon, lat, residual_preds[j, s, i], 
+                            cmap=residual_cmap, vmin=vmin_res, vmax=vmax_res, transform=platecarree_proj
+                        )
+                        axs[i, s+1].set_title(f"Residual {s+1}", fontsize=14)
+
+                    # Plot high-res
+                    im = axs[i, -1].pcolormesh(lon, lat, hr_sample, cmap=prep_colormap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[i, -1].set_title("High-resolution", fontsize=14)
+
+                    # Add colorbars
+                    cbar_hr = plt.colorbar(im, ax=axs[i, :], orientation='vertical', shrink=0.8, extend="max")
+                    cbar_hr.set_label(var + " (mm/day)", fontsize=14)
+
+                    # Add a separate colorbar for residuals if desired (optional)
+                    # If needed, we can just rely on the same colorbar
+                    # but since residual columns might have different scales, we won't add another cbar for each residual column here.
+
+                else:
+                    # Temperature variables
+                    if var == "tasmin":
+                        lr_sample = KToC(lrinterp[j, i])
+                        hr_sample = KToC(hr[j, i])
+                    elif var == "tasmax":
+                        if self.transfo:
+                            lr_sample = KToC(softplus(lrinterp[j, i], c=0.) + lrinterp[j, i-1])
+                            hr_sample = KToC(softplus(hr[j, i], c=0.) + hr[j, i-1])
+                        else:
+                            lr_sample = KToC(lrinterp[j, i])
+                            hr_sample = KToC(hr[j, i])
+
+                    # Determine vmin/vmax for hr/ lr
+                    max_abs = max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.abs(hr_sample)))
+                    max_abs = max(max_abs, 1e-7)  # Avoid zero division
+                    vmin, vmax = -max_abs, max_abs
+
+                    # Residuals for this variable
+                    residual_var = residual_preds[j, :, i, :, :]  # [num_samples, H, W]
+                    max_abs_res = torch.max(torch.abs(residual_var))
+                    max_abs_res = max(max_abs_res, 1e-7)
+                    vmin_res, vmax_res = -max_abs_res, max_abs_res
+
+                    # Plot low-res
+                    axs[i, 0].pcolormesh(lon, lat, lr_sample, cmap=temp_cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[i, 0].set_title("Low-resolution", fontsize=14)
+
+                    # Plot residual predictions
+                    for s in range(num_samples):
+                        axs[i, s+1].pcolormesh(
+                            lon, lat, residual_preds[j, s, i],
+                            cmap=residual_cmap, vmin=vmin_res, vmax=vmax_res, transform=platecarree_proj
+                        )
+                        axs[i, s+1].set_title(f"Residual {s+1}", fontsize=14)
+
+                    # Plot high-res
+                    im = axs[i, -1].pcolormesh(lon, lat, hr_sample, cmap=temp_cmap, vmin=vmin, vmax=vmax, transform=platecarree_proj)
+                    axs[i, -1].set_title("High-resolution", fontsize=14)
+
+                    # Add colorbar
+                    cbar_hr = plt.colorbar(im, ax=axs[i, :], orientation='vertical', shrink=0.8, extend="both")
+                    cbar_hr.set_label(var + " (°C)", fontsize=14)
+
+                # Add coastlines and gridlines
+                for col in range(total_cols):
+                    axs[i, col].coastlines()
+                    gl = axs[i, col].gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    if col > 0:
+                        gl.left_labels = False
+
+                axs[i, 0].set_ylabel(f"{var}", fontsize=14)
+
+            subfigs[j].suptitle(f"Sample {j+1}: {str(float_to_date(timestamps_float[j].item()))[:10]}", fontsize=16)
+
+        fig.suptitle(f"Residual Predictions after the {epoch}th epoch", fontsize=18, fontweight='bold')
+
+        return fig, axs
+    
+    def plot_residual_differences(self, residual_preds, timestamps_float, epoch, N=2, num_samples=3):
+        """
+        Plots the pixel-wise differences between residual predictions:
+        Differences if num_samples=3:
+        - Diff(1-2)
+        - Diff(1-3)
+        - Diff(2-3)
+        These are plotted in a separate figure, one figure for all differences.
+
+        Parameters:
+            residual_preds (torch.Tensor): Residual predictions [N, num_samples, nvars, H, W]
+            timestamps_float (torch.Tensor): Float timestamps for each sample.
+            epoch (int): Current epoch number.
+            N (int): Number of samples to plot.
+            num_samples (int): Number of residual predictions per input (default=3).
+        """
+
+        if num_samples != 3:
+            raise ValueError("This function is implemented for exactly 3 samples to compare differences.")
+
+        # Differences:
+        difference_pairs = [(0,1), (0,2), (1,2)]
+        num_diff_maps = len(difference_pairs)  # should be 3
+
+        rotatedpole_prj = ccrs.RotatedPole(pole_longitude=83.0, pole_latitude=42.5)
+        platecarree_proj = ccrs.PlateCarree()
+
+        # We'll have num_diff_maps columns (3 columns if num_samples=3)
+        total_cols = num_diff_maps
+
+        fig = plt.figure(figsize=(total_cols * 6, N * self.nvars * 4), constrained_layout=True)
+        subfigs = fig.subfigures(N, 1, hspace=0.1)
+        if N == 1:
+            subfigs = [subfigs]
+
+        residual_cmap = cm.get_cmap('RdBu_r')  # Diverging colormap for differences
+
+        for j in range(N):
+            axs = subfigs[j].subplots(self.nvars, total_cols, subplot_kw={'projection': rotatedpole_prj})
+
+            if self.nvars == 1:
+                axs = np.array([axs])
+            elif self.nvars > 1 and total_cols == 1:
+                axs = axs[:, np.newaxis]
+            else:
+                axs = np.array(axs)
+
+            # Convert the dataset's calendar to proleptic_gregorian
+            self.data = self.data.convert_calendar('proleptic_gregorian')
+
+            # Update lat and lon after conversion
+            self.lat = self.data['lat']
+            self.lon = self.data['lon']
+
+            date_str = str(float_to_date(timestamps_float[j].item()))[:10]  # "1994-03-12"
+            lat = self.lat.sel(time=date_str, method="nearest").load().to_numpy().squeeze()
+            lon = self.lon.sel(time=date_str, method="nearest").load().to_numpy().squeeze()
+
+            # Compute differences for the j-th sample
+            diff_maps = []
+            for (a, b) in difference_pairs:
+                diff_maps.append(residual_preds[j, b] - residual_preds[j, a])
+            diff_maps = torch.stack(diff_maps, dim=0)  # [num_diff_maps, nvars, H, W]
+
+            for i, var in enumerate(self.variables):
+                # Determine scale for differences
+                diff_max_abs = torch.max(torch.abs(diff_maps[:, i, :, :]))
+                diff_max_abs = max(diff_max_abs, 1e-7)
+                vmin_diff, vmax_diff = -diff_max_abs, diff_max_abs
+
+                for d_idx, (a, b) in enumerate(difference_pairs):
+                    im_diff = axs[i, d_idx].pcolormesh(
+                        lon, lat, diff_maps[d_idx, i],
+                        cmap=residual_cmap, vmin=vmin_diff, vmax=vmax_diff, transform=platecarree_proj
+                    )
+                    axs[i, d_idx].set_title(f"Diff {a+1}-{b+1}")
+                    axs[i, d_idx].coastlines()
+                    gl = axs[i, d_idx].gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
+                    gl.top_labels = False
+                    gl.right_labels = False
+                    if d_idx > 0:
+                        gl.left_labels = False
+
+                axs[i, 0].set_ylabel(f"{var}")
+                # Add a colorbar for the differences at the end of each row
+                cbar_diff = plt.colorbar(im_diff, ax=axs[i, :], orientation='vertical', shrink=0.8)
+                cbar_diff.set_label("Difference", fontsize=14)
+
+            subfigs[j].suptitle(f"Sample {j+1}: {str(float_to_date(timestamps_float[j].item()))[:10]}")
+
+        fig.suptitle(f"Residual Prediction Differences after the {epoch}th epoch", fontsize=16)
+        return fig, axs
+    
 #######
 
 class climexEDA:

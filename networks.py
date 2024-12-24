@@ -236,8 +236,8 @@ class UNet(torch.nn.Module):
         num_blocks          = 2,            # Number of residual blocks per resolution.
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
         dropout             = 0.10,         # List of resolutions with self-attention.
-        label_dropout       = 0.1,            # Dropout probability of class labels for classifier-free guidance.
-        use_diffuse = False                  # Use Unet for diffusion
+        label_dropout       = 0.1,          # Dropout probability of class labels for classifier-free guidance.
+        use_diffuse = False                 # Use Unet for diffusion
     ):
         super().__init__()
         self.label_dropout = label_dropout
