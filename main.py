@@ -5,7 +5,7 @@ import numpy as np
 import metrics
 import climex_utils as cu
 import trainmodel as tm
-import deterministic_unet
+import deterministic_unet_shuffle_lnr as unet
 
 import os
 import time
@@ -37,6 +37,8 @@ def run_combination(pipeline, unet, transfo):
      - transfo (bool): whether to use the transformation or not
     """
 
+    version="mse"
+
     seed_everything(0)
     args = tm.get_args()
 
@@ -45,12 +47,6 @@ def run_combination(pipeline, unet, transfo):
         lr = 1e-3
     else:
         lr = 1e-4
-
-    # some combinations are not valid (lr inputs and symmetric unet, hr inputs and asymmetric unet)
-    if pipeline[:3] == "lr_" and unet == "symmetric":
-        return
-    elif pipeline[:8] == "lrinterp" and unet[0] == "a":
-        return
     
     print(f"Running {pipeline}-{unet}-{transfo}-{lr}")
 
@@ -68,8 +64,7 @@ def run_combination(pipeline, unet, transfo):
     dataloader_val = torch.utils.data.DataLoader(dataset_val, batch_size=args.batch_size, shuffle=False)
 
     # Initializing model
-    model = deterministic_unet.UNetAll(type=unet, img_resolution=args.resolution, in_channels=len(args.variables), channel_mult=[1,2,3,4], num_res_blocks=2, 
-                                       out_channels=len(args.variables), ds_scale=args.lowres_scale)
+    model = unet.UNet(img_resolution=args.resolution, in_channels=len(args.variables), out_channels=len(args.variables))
     model.to(args.device)
 
     # Initializing optimizer, loss function, early stopper and learning rate scheduler
@@ -128,8 +123,7 @@ def run_combination(pipeline, unet, transfo):
     # Training the model on the full training set
     training_set = cu.climex2torch(args.datadir, years=args.years_train, coords=args.coords, lowres_scale=args.lowres_scale, transfo=transfo, type=pipeline, megafile='data_train.nc')
     dataloader_train = torch.utils.data.DataLoader(training_set, batch_size=args.batch_size, shuffle=True)
-    model = deterministic_unet.UNetAll(type=unet, img_resolution=args.resolution, in_channels=len(args.variables), channel_mult=[1,2,3,4], num_res_blocks=2, 
-                                       out_channels=len(args.variables), ds_scale=args.lowres_scale)
+    model = unet.UNet(img_resolution=args.resolution, in_channels=len(args.variables), out_channels=len(args.variables))
     model.to(args.device)
     optimizer = args.optimizer(params=model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.1)
@@ -151,9 +145,9 @@ def run_combination(pipeline, unet, transfo):
     results["spatial_constraint_violations_avg"] = violations_avg
 
     # Saving the model checkpoint and some training logs 
-    os.makedirs(f"./results/{pipeline}-{unet}-{transfo}", exist_ok=True)
-    torch.save(model.state_dict(), f"./results/{pipeline}-{unet}-{transfo}/model.pt")
-    with open(f"./results/{pipeline}-{unet}-{transfo}/logs.txt", "w") as f:
+    os.makedirs(f"./results/unet-lnr", exist_ok=True)
+    torch.save(model.state_dict(), f"./results/unet-lnr/model.pt")
+    with open(f"./results/unet-lnr/logs.txt", "w") as f:
         f.write(str("Training time in minutes: " + str(results["training_time"])))
         f.write("\n")
         f.write(str("Training epochs: " + str(results["training_epochs"])))
@@ -166,36 +160,42 @@ def run_combination(pipeline, unet, transfo):
     spatial_mae = pd.DataFrame(results["spatial_mae"])
     spatial_violations_count = pd.DataFrame(results["spatial_constraint_violations_count"])
     spatial_violations_avg = pd.DataFrame(results["spatial_constraint_violations_avg"])
-    temporal_mae.to_csv(f"./results/{pipeline}-{unet}-{transfo}/temporal_mae.csv", index=False)
-    spatial_mae.to_csv(f"./results/{pipeline}-{unet}-{transfo}/spatial_mae.csv", index=False)
-    spatial_violations_count.to_csv(f"./results/{pipeline}-{unet}-{transfo}/spatial_violations_count.csv", index=False)
-    spatial_violations_avg.to_csv(f"./results/{pipeline}-{unet}-{transfo}/spatial_violations_avg.csv", index=False)
+    temporal_mae.to_csv(f"./results/unet-lnr/temporal_mae.csv", index=False)
+    spatial_mae.to_csv(f"./results/unet-lnr/spatial_mae.csv", index=False)
+    spatial_violations_count.to_csv(f"./results/unet-lnr/spatial_violations_count.csv", index=False)
+    spatial_violations_avg.to_csv(f"./results/unet-lnr/spatial_violations_avg.csv", index=False)
     
     #_, (fig, axs) = tm.sample_model(model=model, dataloader=dataloader_val, epoch=e, device=args.device)
     #fig.savefig(f"./results/{pipeline}-{unet}-{transfo}/samples.png")
     #plt.close(fig)
 
     # Saving the power spectrum density of the model's predictions
-    hr_pred_psd_pr, hr_pred_psd_tasmin, hr_pred_psd_tasmax = metrics.compute_psd_over_loader(model, dataloader_val, device=args.device)
+    hr_pred_psd_pr, hr_pred_psd_tasmin, hr_pred_psd_tasmax, famp_pr, famp_tmin, famp_tmax = metrics.compute_psd_over_loader(model, dataloader_val, device=args.device)
     hr_pred_psd_pr = pd.Series(hr_pred_psd_pr)
     hr_pred_psd_tasmin = pd.Series(hr_pred_psd_tasmin)
     hr_pred_psd_tasmax = pd.Series(hr_pred_psd_tasmax)
     pred_psd = pd.concat([hr_pred_psd_pr, hr_pred_psd_tasmin, hr_pred_psd_tasmax], axis=1)
     pred_psd.columns = ["pr", "tasmin", "tasmax"]
-    pred_psd.to_csv(f"./results/{pipeline}-{unet}-{transfo}/psd_pred_unet.csv", index=False)
+    pred_psd.to_csv(f"./results/unet-lnr/psd_pred_unet.csv", index=False)
+    famp_pr = pd.Series(famp_pr.flatten())
+    famp_tmin = pd.Series(famp_tmin.flatten())
+    famp_tmax = pd.Series(famp_tmax.flatten())
+    famp = pd.concat([famp_pr, famp_tmin, famp_tmax], axis=1)
+    famp.columns = ["pr", "tasmin", "tasmax"]
+    famp.to_csv(f"./results/unet-lnr/famp.csv", index=False)
 
     # Saving training and validation losses
     for var in args.variables:
         loss_var = pd.DataFrame({"training": tr_losses[var], "early_stop": es_losses[var]})
-        loss_var.to_csv(f"./results/{pipeline}-{unet}-{transfo}/loss_{var}.csv", index=False)
+        loss_var.to_csv(f"./results/unet-lnr/loss_{var}.csv", index=False)
 
 
 if __name__ == "__main__":
 
     # Search arguments
-    combinations = {"pipeline": ["lrinterp_to_residuals", "lrinterp_to_hr", "lr_to_residuals", "lr_to_hr"],
-                    "unet": ["symmetric", "asymmetric_wskips", "asymmetric_woskips"],
-                    "transfo": [False, True]}
+    combinations = {"pipeline": ["lr_to_hr"],
+                    "unet": ["symmetric"],
+                    "transfo": [True]}
     
     for pipeline in combinations["pipeline"]:
         for unet in combinations["unet"]:

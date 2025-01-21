@@ -102,7 +102,7 @@ class climex2torch(Dataset):
         else:
 
             print("Opening and lazy loading megafile")
-            self.data = xr.open_dataset(self.megafile, engine="h5netcdf")[self.variables]
+            self.data = xr.open_dataset(self.megafile)[self.variables]
         
         # Extracting latitude and longitude data (for plotting function) and timestamps
         self.lon = self.data.lon
@@ -180,7 +180,7 @@ class climex2torch(Dataset):
             lr_stand = (lr - self.lrstats[0][0]) / (self.lrstats[0][1] + self.epsilon)
             hr_stand = (hr - self.lrstats[1][0]) / (self.lrstats[1][1] + self.epsilon)
 
-            residual = hr_stand - nn.functional.interpolate(input=lr_stand.unsqueeze(0), scale_factor=self.lowres_scale).squeeze()
+            residual = hr_stand - nn.functional.interpolate(input=lr_stand.unsqueeze(0), scale_factor=self.lowres_scale, mode="bilinear").squeeze()
 
             return {"inputs": lr_stand,
                     "targets": residual,
@@ -188,7 +188,7 @@ class climex2torch(Dataset):
                     "timestamps_float": self.timestamps_float[idx],
                     "hr": hr, 
                     "lr": lr,
-                    "lrinterp": nn.functional.interpolate(input=lr.unsqueeze(0), scale_factor=self.lowres_scale).squeeze()}
+                    "lrinterp": nn.functional.interpolate(input=lr.unsqueeze(0), scale_factor=self.lowres_scale, mode="bilinear").squeeze()}
         
         elif self.type == "lrinterp_to_residuals":
 
@@ -245,27 +245,36 @@ class climex2torch(Dataset):
 
 
     # Computes the statistics of the low-resolution data for standardization
-    def compute_stats(self):
+    def compute_stats(self, linear_regression=False):
 
-        lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(self.hr)
+        if linear_regression:
+            lr = self.lrpreds
+        else:
+            lr = nn.AvgPool2d(kernel_size=self.lowres_scale)(self.hr)
 
         mean, std = lr.mean(dim=0), lr.std(dim=0) 
         # Extend the dimension to match high-resolution
-        mean_hrdim = mean.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
-        std_hrdim = std.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
+        if linear_regression:
+            mean_hrdim = None
+            std_hrdim = None
+        else:
+            mean_hrdim = mean.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
+            std_hrdim = std.repeat_interleave(repeats=self.lowres_scale, dim=1).repeat_interleave(repeats=self.lowres_scale, dim=2)
 
         return (mean, std), (mean_hrdim, std_hrdim)
 
     # Computes the inverse of the standardization for the residual
-    def invstand_residual(self, standardized_residual):
-        if self.type == "lr_to_hr" or self.type == "lrinterp_to_hr":
+    def invstand_residual(self, standardized_residual, linear_regression=False):
+        if linear_regression:
+            return standardized_residual * (self.lrstats[0][1] + self.epsilon)
+        elif self.type == "lr_to_hr" or self.type == "lrinterp_to_hr":
             return standardized_residual * (self.lrstats[1][1] + self.epsilon) + self.lrstats[1][0]
         elif self.type == "lrinterp_to_residuals" or self.type == "lr_to_residuals":
             return standardized_residual * (self.lrstats[1][1] + self.epsilon)
     
     # Adds the predicted residual to the input upsampled high-resolution
-    def residual_to_hr(self, residual, lrinterp):
-        return lrinterp + self.invstand_residual(residual)
+    def residual_to_hr(self, residual, lrinterp, linear_regression=False):
+        return lrinterp + self.invstand_residual(residual, linear_regression)
     
     # Plot a batch (N) of samples (upsampled low-resolution, predicted high-resolution, groundtruth high-resolution)
     def plot_batch(self, lrinterp, hr_pred, hr, timestamps, epoch, N=2):
@@ -416,8 +425,6 @@ class climex2torch(Dataset):
             axs[j][0, 3].set_title("Absolute error", fontsize=14)
 
         fig.suptitle("Predictions after the " + str(epoch) + "th epoch for " + str(N) + " random validation dates", fontsize=18, fontweight='bold')
-
-        plt.show()
 
         return fig, axs
     

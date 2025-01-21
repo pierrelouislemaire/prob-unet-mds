@@ -25,6 +25,7 @@ def get_args():
     parser.add_argument('--years_subtrain', type=range, default=range(1960, 1980))
     parser.add_argument('--years_earlystop', type=range, default=range(1980, 1990))
     parser.add_argument('--years_val', type=range, default=range(1990, 1998))
+    parser.add_argument('--years_megatrain', type=range, default=range(1960, 1998))
     parser.add_argument('--years_test', type=range, default=range(1998, 2006))
     parser.add_argument('--coords', type=list, default=[80, 208, 100, 228])
     parser.add_argument('--resolution', type=tuple, default=(128, 128))
@@ -90,14 +91,14 @@ class EarlyStopper:
         # if the validation loss is lower than the previous minimum, save the model as best model
         if validation_loss < self.min_validation_loss:
             self.min_validation_loss = validation_loss
-            torch.save(model.state_dict(), f"./last_best_model_hr.pt")
+            torch.save(model.state_dict(), f"./last_best_model.pt")
             self.counter = 0
 
         elif validation_loss > (self.min_validation_loss + self.min_delta):
             self.counter += 1
             # if the counter is greater than the patience, load the best model and return True to break training
             if self.counter >= self.patience:
-                model.load_state_dict(torch.load(f"./last_best_model_hr.pt"))
+                model.load_state_dict(torch.load(f"./last_best_model.pt"))
                 return True, model
         return False, model
 
