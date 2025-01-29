@@ -298,7 +298,7 @@ class ProbabilisticUNet(nn.Module):
         total_recon_loss = nn.L1Loss()(output, target)  # Average to total loss
 
         # KL divergence between posterior and prior
-        kl_div = kl.kl_divergence(self.prior_latent_space, self.posterior_latent_space)
+        kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space)
 
         # Define the standard Gaussian distribution
         standard_gaussian = Independent(
