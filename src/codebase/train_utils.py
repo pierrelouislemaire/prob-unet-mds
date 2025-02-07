@@ -48,7 +48,7 @@ def get_args():
     # ML training arguments
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=30)
-    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--optimizer', type=object, default=torch.optim.AdamW)
 
@@ -94,6 +94,16 @@ class EarlyStopper:
                 model.load_state_dict(torch.load(f"./last_best_model.pt"))
                 return True, model
         return False, model
+    
+def l2_regularisation(m):
+    l2_reg = None
+
+    for W in m.parameters():
+        if l2_reg is None:
+            l2_reg = W.norm(2)
+        else:
+            l2_reg = l2_reg + W.norm(2)
+    return l2_reg
 
 
 def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
@@ -120,9 +130,9 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
 
         variables = dataloader.dataset.variables
 
-        running_losses_mae = {var: [] for var in variables}
+        running_losses_mae = []
         running_losses_kl = []
-        running_losses_kl2 = []
+        #running_losses_kl2 = []
         step_losses = []
 
         # Looping over the entire dataloader set
@@ -137,11 +147,17 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
 
             # Performing forward pass and computing loss
             if prob:
-                loss, recon_loss, kl_div, kl_div2 = model.elbo(inputs, targets, timestamps)
+                if model.use_geco:
+                    loss, recon_loss, kl_div = model.geco(inputs, targets, timestamps)
+                    model.lagrange_mult = model.lagrange_mult*torch.exp(model.constraint_ma)
+                else:
+                    loss, recon_loss, kl_div = model.elbo(inputs, targets, timestamps)
+                reg_loss = l2_regularisation(model.posterior) + l2_regularisation(model.prior) + l2_regularisation(model.fcomb.layers)
+                loss = loss + 1e-5 * reg_loss
             else:
                 preds = model(inputs, timestamps)
                 loss = loss_fn(preds, targets)
-
+            
             # Backward pass
             loss.backward()
             optimizer.step()
@@ -149,13 +165,13 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
             # Log losses for each variable
             for idx, var in enumerate(variables):
                 if prob:
-                    running_losses_mae[var].append(recon_loss[idx])
+                    running_losses_mae.append(recon_loss.item())
                 else:
                     var_loss = torch.nn.L1Loss()(preds[:,idx,:,:], targets[:,idx,:,:])
                     running_losses_mae[var].append(var_loss.item())
             if prob:
-                running_losses_kl.append(torch.mean(kl_div).detach().cpu())
-                running_losses_kl2.append(torch.mean(kl_div2).detach().cpu())
+                running_losses_kl.append(kl_div.detach().cpu())
+                #running_losses_kl2.append(torch.mean(kl_div2).detach().cpu())
 
             tq.set_postfix_str(s=f'Loss: {(loss.item()):.4f}')
             step_losses.append(loss.item())
@@ -163,11 +179,11 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
         mean_loss = sum(step_losses) / len(step_losses)
         tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')
 
-        epoch_losses_mae = {var: sum(running_losses_mae[var]) / len(running_losses_mae[var]) for var in variables}
+        epoch_losses_mae = sum(running_losses_mae) / len(running_losses_mae)
         if prob:
             epoch_losses_kl = sum(running_losses_kl) / len(running_losses_kl)
-            epoch_losses_kl2 = sum(running_losses_kl2) / len(running_losses_kl2)
-            return epoch_losses_mae, epoch_losses_kl, epoch_losses_kl2, kl_div, kl_div2
+            #epoch_losses_kl2 = sum(running_losses_kl2) / len(running_losses_kl2)
+            return epoch_losses_mae, epoch_losses_kl
         else:
             return epoch_losses_mae
 
@@ -190,11 +206,11 @@ def sample_model(model, dataloader, epoch, prob, num_samples, device):
     model.eval()
     batch = next(iter(dataloader))
 
-    inputs, lrinterp, hr, timestamps = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch['timestamps_float'])
+    inputs, lrinterp, hr, timestamps, timestamps_float = (batch['inputs'].to(device), batch['lrinterp'], batch['hr'], batch["timestamps"], batch['timestamps_float'])
     if prob:
         preds = []
         for _ in range(num_samples):
-            output = model(inputs, t=timestamps, training=False) # Generate output from the model
+            output = model(inputs, t=timestamps.unsqueeze(dim=1).to(device), training=False) # Generate output from the model
             pred = dataloader.dataset.invstand_residual(output.cpu())  # Convert residual to high-res
             preds.append(pred) # Append the prediction to the list
         preds = torch.stack(preds, dim=1)  # Shape: [batch_size, num_samples, channels, height, width]
@@ -210,7 +226,7 @@ def sample_model(model, dataloader, epoch, prob, num_samples, device):
             lrinterp = lrinterp.unsqueeze(1)
         hr_preds = dataloader.dataset.residual_to_hr(preds.detach().cpu(), lrinterp)
 
-    fig, axs = dataloader.dataset.plot_batch(lrinterp.cpu(), hr_preds.cpu(), hr.cpu(), timestamps.cpu(), epoch, N=2)
+    fig, axs = dataloader.dataset.plot_batch(lrinterp.cpu(), hr_preds.cpu(), hr.cpu(), timestamps_float, epoch, N=2)
 
     return hr_preds, (fig, axs)
 

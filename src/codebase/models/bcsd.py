@@ -9,8 +9,8 @@ def BCSD(datatrain, datatest):
     lr_monthly_avg = datatrain.data.to_array().coarsen(rlat=ds_factor, rlon=ds_factor).mean().groupby('time.month').mean()
     scale = lr_proj - lr_monthly_avg
 
-    scale_interp_data = torch.nn.functional.interpolate(torch.from_numpy(scale.data), scale_factor=ds_factor, mode='bilinear')
+    scale_interp_data = torch.nn.functional.interpolate(torch.from_numpy(scale.to_numpy()), scale_factor=ds_factor, mode='bilinear')
     scale_interp = xr.DataArray(scale_interp_data, coords={"time": scale.time, "rlat": datatrain.data.rlat, "rlon":datatrain.data.rlon}, dims=scale.dims)
     bcsd = datatrain.data.to_array().groupby('time.month').mean() + scale_interp.groupby('time.month')
 
-    return torch.from_numpy(bcsd.data).transpose(0, 1)
+    return torch.from_numpy(bcsd.to_numpy()).transpose(0, 1)

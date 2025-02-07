@@ -8,7 +8,6 @@ from cartopy import crs as ccrs
 
 import codebase.data_utils as du
 import codebase.train_utils as tu
-import codebase.metrics as metrics
 import codebase.models.bcsd as bcsd
 import codebase.models.linearregression as lr
 
@@ -19,8 +18,10 @@ if __name__ == "__main__":
 
     args = tu.get_args()
 
-    trainset = du.climex2torch(datadir=args.datadir, years=args.years_megatrain, coords=args.coords, type="lrinterp_to_residuals", lowres_scale=16, transfo=True, megafile="data/data_megatrain.nc")
-    testset = du.climex2torch(datadir=args.datadir, years=args.years_test, coords=args.coords, type="lrinterp_to_residuals", lowres_scale=16, transfo=True, megafile="data/data_test.nc")
+    trainset = du.climex2torch(args.datadir, years=args.years_megatrain, coords=args.coords, lowres_scale=args.lowres_scale,
+                               transfo=args.transfo, type=args.pipeline)
+    testset = du.climex2torch(args.datadir, years=args.years_test, coords=args.coords, lowres_scale=args.lowres_scale,
+                              transfo=args.transfo, type=args.pipeline)
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 
     lat, lon = testset.data.lat[0].load().data, testset.data.lon[0].load().data
@@ -34,8 +35,8 @@ if __name__ == "__main__":
     test_nninterp = torch.nn.functional.interpolate(test_lr, scale_factor=args.lowres_scale, mode="nearest")
     test_bcsd = bcsd.BCSD(trainset, testset)
     test_linearregression = lr.get_lr_preds()["test_preds"]
-    test_probunet = torch.from_numpy(np.load("codebase/predictions/probabilistic_unet.npy"))
-    test_detunet = torch.from_numpy(np.load("codebase/predictions/deterministic_unet.npy"))
+    test_probunet = torch.from_numpy(np.load("src/codebase/predictions/probabilistic_unet_beta.npy"))
+    test_detunet = torch.from_numpy(np.load("src/codebase/predictions/deterministic_unet_dom128128.npy"))
 
     preds_list = [test_nninterp, test_bcsd, test_linearregression, test_detunet, test_probunet]
     list_names = ["1nn", "bcsd", "linear regression", "deterministic unet", "probabilistic unet"]
@@ -43,13 +44,14 @@ if __name__ == "__main__":
     styles = ["-", "--", "-.", "--", "-"]
     #markers = [">", "*", "X", "<", "o"]
 
-    title_log = "posterior+gaussian_prior+posterior_131fcomb"
-    os.makedirs(f"out/{title_log}", exist_ok=True)
+    title_log = "beta"
+    os.makedirs(f"src/out/{title_log}", exist_ok=True)
 
     # -------------------------- #
     #   Compute and log metrics  #
 
     # PSD
+    import codebase.metrics as metrics
 
     test_bcinterp = torch.nn.functional.interpolate(test_lr, scale_factor=args.lowres_scale, mode="bicubic") # instead of NN interp for plot readibility
     psd_list_names =["bicubic"] + list_names[1:]
@@ -102,7 +104,7 @@ if __name__ == "__main__":
     axs[2].set_ylim(top=2.5e9)
     axs[0].set_ylabel("Mean Power (dB)")
     axs[2].legend(loc="lower left", fontsize=14)
-    fig.savefig(f"out/{title_log}/psd.png")
+    fig.savefig(f"src/out/{title_log}/psd.png")
 
     # MAE, RMSE and CRPS
 
@@ -128,7 +130,7 @@ if __name__ == "__main__":
         rmse.append(torch.sqrt(((test_hr - preds) ** 2).mean(dim=(0, 2, 3))).numpy())
     crps_probunet = metrics.crps_over_groundtruth(test_hr, test_probunet)
 
-    f = open(f"out/{title_log}/reduced_metrics.txt", "w")
+    f = open(f"src/out/{title_log}/reduced_metrics.txt", "w")
     f.write(f"MAE\n")
     for i, name in enumerate(list_names):
         if name == "probabilistic unet":
@@ -160,7 +162,7 @@ if __name__ == "__main__":
             ax.set_xticks([.92, .94, .96, .98])
     axs[0].set_ylabel("MAE")
     axs[0].legend(loc="upper left", fontsize=14)
-    fig.savefig(f"out/{title_log}/quantile_mae.png")
+    fig.savefig(f"src/out/{title_log}/quantile_mae.png")
 
     fig, axs = plt.subplots(1, 3, figsize=(20, 6))
     for i, ax in enumerate(axs):
@@ -175,7 +177,7 @@ if __name__ == "__main__":
             ax.set_xticks([.92, .94, .96, .98])
     axs[0].set_ylabel("RMSE")
     axs[0].legend(loc="upper left", fontsize=14)
-    fig.savefig(f"out/{title_log}/quantile_rmse.png")
+    fig.savefig(f"src/out/{title_log}/quantile_rmse.png")
 
     # Distribution histograms
 
@@ -198,12 +200,12 @@ if __name__ == "__main__":
         axs[i].set_ylabel("Log-Freq")
         axs[i].set_xlabel(var)
     axs[0].legend(loc="upper right", fontsize=14)
-    fig.savefig(f"out/{title_log}/distribution_histograms.png")
+    fig.savefig(f"src/out/{title_log}/distribution_histograms.png")
 
     # Spread-Skill Ratio 
 
     ssr_probunet = metrics.spread_skill_ratio(test_hr, test_probunet, reduction_dims=(0, 2, 3))
-    f = open(f"out/{title_log}/reduced_metrics.txt", "a")
+    f = open(f"src/out/{title_log}/reduced_metrics.txt", "a")
     f.write(f"\nSSR\n")
     f.write(f"probabilistic unet: {ssr_probunet}\n")
     f.close()
@@ -227,16 +229,42 @@ if __name__ == "__main__":
         im = ax.pcolormesh(lon, lat, spatial_ssr_probunet[i], transform=platecarree_proj, cmap="PiYG", vmin=vmin, vmax=vmax)
         ax.set_title(args.variables[i])
         plt.colorbar(im, extend="both", shrink=0.75)
-    fig.savefig(f"out/{title_log}/spatial_ssr.png")
+    fig.savefig(f"src/out/{title_log}/spatial_ssr.png")
 
     # SAL
 
-    f = open(f"out/{title_log}/reduced_metrics.txt", "a")
+    f = open(f"src/out/{title_log}/reduced_metrics.txt", "a")
     f.write(f"\nSAL\n")
     for preds, name in zip(preds_list, list_names):
         sal = metrics.sal(preds, test_hr)
         f.write(f"{name}: {sal}\n")
     f.close()
+
+    # Training reconstruction error + KL w/ beta annealing
+    
+    training_mae = np.load("src/codebase/logs/probabilistic_unet_beta_mae.npy")
+    training_kl = np.load("src/codebase/logs/probabilistic_unet_beta_kl.npy")
+
+    nb_epochs = training_mae.shape[0]
+    betas = np.cat(np.array([1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]), np.ones(nb_epochs-8))
+
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+
+    ax.plot(np.arange(1, nb_epochs+1), training_mae, label="MAE", color="teal")
+    ax.set_ylabel("MAE")
+    ax.set_xlabel("Epoch")
+
+    ax2 = ax.twinx()
+    ax2.plot(np.arange(1, nb_epochs+1), training_kl, label="KL", color="magenta")
+    ax2.set_ylabel("KL")
+    ax2.set_xlabel("Epoch")
+    
+    ax2.set_xticks(np.arange(1, 9, 1), [f"{i} \n 1e-{i}" for i in range(9)])
+
+    fig.legend()
+    fig.savefig(f"src/out/{title_log}/training_curves.png")
+
 
 
 

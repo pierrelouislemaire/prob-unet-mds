@@ -129,18 +129,18 @@ class climex2torch(Dataset):
         self.timestamps = torch.from_numpy(np.array(month + day)).float()
         self.timestamps_float = date_to_float(time)
 
-        data_temp = self.data
+        self.data_temp = self.data
 
         # Dropping unnecessary variables and encoding
-        data_temp = data_temp.drop_vars(["lat", "lon"]).drop_indexes(["rlon", "rlat"]).drop_encoding().to_array()
+        self.data_temp = self.data_temp.drop_vars(["lat", "lon"]).drop_indexes(["rlon", "rlat"]).drop_encoding().to_array()
 
         print("Loading dataset into memory")
-        data_temp.load()
+        self.data_temp.load()
 
         print("Converting xarray Dataset to Pytorch tensor")
 
         # Loading into memory high-resolution ground-truth data from desired spatial window and converting to Pytorch tensor (time, nvar, height, width)
-        self.hr = torch.from_numpy(data_temp.to_numpy()).transpose(0, 1)
+        self.hr = torch.from_numpy(self.data_temp.to_numpy()).transpose(0, 1)
 
         # Tranformations (prep > 0 and tmax > tmin)
         if self.transfo:
@@ -320,7 +320,7 @@ class climex2torch(Dataset):
         total_cols= num_samples + 3
 
         # Initializing figure and subfigures (one subfigure per date)
-        fig = plt.figure(figsize=(N * 18, 12), constrained_layout=True)
+        fig = plt.figure(figsize=(N * 18, 10), constrained_layout=True)
         subfigs = fig.subfigures(1, N, wspace=0.05)
 
         # Different colormaps for different type of climate variables
@@ -363,7 +363,7 @@ class climex2torch(Dataset):
                         lr_sample = kgm2sTommday(lrinterp[j,i])
                         hr_preds_samples = [kgm2sTommday(hr_preds[j, s, i]) for s in range(num_samples)]
                         hr_sample = kgm2sTommday(hr[j,i])
-                    vmin, vmax = 0, max(torch.amax(lr_sample), torch.amax(hr_preds_samples), torch.amax(hr_sample))
+                    vmin, vmax = 0, max(torch.amax(lr_sample), torch.amax(torch.stack(hr_preds_samples, dim=0)), torch.amax(hr_sample))
 
                     # Computing absolute error and setting corresponding vmin, vmax
                     error_sample = torch.abs(hr_sample - torch.mean(torch.stack(hr_preds_samples), dim=0)) 
@@ -402,7 +402,7 @@ class climex2torch(Dataset):
 
                     # Converting units in °C and computing scaling values for diverging colormap
                     if self.variables[i] == "tasmin":
-                        lr_sample, hr_preds_samples, hr_sample = KToC(lrinterp[j,i]), [KToC(hr_preds[j,s,i] for s in range(num_samples))], KToC(hr[j,i])
+                        lr_sample, hr_preds_samples, hr_sample = KToC(lrinterp[j,i]), [KToC(hr_preds[j,s,i]) for s in range(num_samples)], KToC(hr[j,i])
                     elif self.variables[i] == "tasmax":
                         if self.transfo:
                             lr_sample = KToC(softplus(lrinterp[j,i], c=0.) + lrinterp[j,i-1])
@@ -412,7 +412,7 @@ class climex2torch(Dataset):
                             lr_sample = KToC(lrinterp[j,i])
                             hr_preds_samples = [KToC(hr_preds[j,s,i]) for s in range(num_samples)]
                             hr_sample = KToC(hr[j,i])
-                    max_abs = max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.amax(hr_preds_samples)), torch.amax(torch.amax(hr_sample)))
+                    max_abs = max(torch.amax(torch.abs(lr_sample)), torch.amax(torch.abs(torch.stack(hr_preds_samples, dim=0))), torch.amax(torch.abs(hr_sample)))
                     vmin, vmax = -max_abs, max_abs
 
                     # Storing max_abs for computing shared vmin and vmax values for tasmin and tasmax later

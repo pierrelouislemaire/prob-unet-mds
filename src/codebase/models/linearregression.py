@@ -8,15 +8,14 @@ import codebase.train_utils as tu
 def get_lr_preds(data_path="data/"):
 
     args = tu.get_args()
-    args.lowres_scale = 16
     trainset = du.climex2torch(datadir=args.datadir, years=args.years_train, coords=args.coords, 
-                               lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr", megafile=str(data_path + "data_train.nc"))
+                               lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr")
     valset = du.climex2torch(datadir=args.datadir, years=args.years_val, coords=args.coords, 
-                               lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr", megafile=str(data_path + "data_val.nc"))
+                               lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr")
     megatrainset = du.climex2torch(datadir=args.datadir, years=args.years_megatrain, coords=args.coords,
-                                   lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr", megafile=str(data_path + "data_megatrain.nc"))
+                                   lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr")
     testset = du.climex2torch(datadir=args.datadir, years=args.years_test, coords=args.coords, 
-                               lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr", megafile=str(data_path + "data_test.nc"))
+                               lowres_scale=args.lowres_scale, transfo=True, type="lr_to_hr")
     
     hr_res = args.resolution[0]
     lr_res = hr_res // args.lowres_scale

@@ -176,7 +176,7 @@ class ProbabilisticUNet(nn.Module):
     The Probabilistic U-Net model combining a U-Net backbone with a variational latent space.
     """
 
-    def __init__(self, input_channels, num_classes, latent_dim=6, num_filters=[64, 128, 256, 512], beta_0 = 1.0, beta_1=1.0, beta_2=1.0):
+    def __init__(self, input_channels, num_classes, latent_dim=6, num_filters=[64, 128, 256, 512], beta_0 = 1.0, beta_1=1.0, beta_2=1.0, use_geco=False):
         super(ProbabilisticUNet, self).__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -185,6 +185,11 @@ class ProbabilisticUNet(nn.Module):
         self.beta_0 = beta_0
         self.beta_1 = beta_1
         self.beta_2 = beta_2
+        self.use_geco = use_geco
+        self.lagrange_mult = 1.0
+        self.threshold_k = 0.14
+        self.mae_alpha = 0.9
+        self.constraint_ma = 0
 
         # Initialize the U-Net backbone
         self.unet = UNet(
@@ -299,6 +304,7 @@ class ProbabilisticUNet(nn.Module):
 
         # KL divergence between posterior and prior
         kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space)
+        kl_div = torch.mean(kl_div)
 
         # Define the standard Gaussian distribution
         standard_gaussian = Independent(
@@ -310,8 +316,35 @@ class ProbabilisticUNet(nn.Module):
         )
 
         # KL divergence between posterior and standard Gaussian
-        kl_div2 = kl.kl_divergence(self.posterior_latent_space, standard_gaussian)
+        #kl_div2 = kl.kl_divergence(self.posterior_latent_space, standard_gaussian)
 
-        total_loss = self.beta_0 * total_recon_loss + self.beta_1 * torch.mean(kl_div) + self.beta_2 * torch.mean(kl_div2)
+        total_loss = self.beta_0 * total_recon_loss + self.beta_1 * kl_div #+ self.beta_2 * torch.mean(kl_div2)
 
-        return total_loss, recon_loss_list, kl_div, kl_div2
+        return total_loss, total_recon_loss, kl_div#, kl_div2
+    
+    def geco(self, x, target, t):
+
+        # Get features from the UNet backbone      
+        unet_features = self.unet(x, t)
+
+        # Compute prior and posterior distributions
+        self.prior_latent_space = self.prior(x)
+        self.posterior_latent_space = self.posterior(x, target)
+
+        # Sample z from the posterior
+        z_posterior = self.posterior_latent_space.rsample()
+
+        #z_posterior = self.latent_amplificator(z_posterior)
+
+        # Compute the output
+        output = self.fcomb(unet_features, z_posterior)
+
+        constraint = torch.nn.L1Loss()(output, target) - self.threshold_k**2
+        
+        kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space)
+        kl_div = torch.mean(kl_div)
+
+        geco_loss = kl_div + self.lagrange_mult * constraint
+        recon_loss = constraint + self.threshold_k**2
+
+        return geco_loss, recon_loss, kl_div
