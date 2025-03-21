@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.distributions import Normal, Independent, kl
 from codebase.models.deterministic_unet import UNet
 
@@ -19,6 +20,48 @@ def init_weights(m):
         #nn.init.normal_(m.weight, std=0.001)
         #nn.init.normal_(m.bias, std=0.001)
         truncated_normal_(m.bias, mean=0, std=0.001)
+
+class ResidualBlock(nn.Module):
+    
+    """
+    Residual block used in the prior and posterior networks.
+    """
+
+    def __init__(self, in_channels, out_channels):
+        super(ResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.res_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+
+        """
+        Forward pass of the residual block.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            x (torch.Tensor): Output tensor.
+        """
+        residual = x
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+
+        x += self.res_conv(residual)
+        x = self.relu(x)
+
+        return x
 
 class AxisAlignedConvGaussian(nn.Module):
 
@@ -112,6 +155,8 @@ class Fcomb(nn.Module):
         super(Fcomb, self).__init__()
         self.latent_dim = latent_dim
         self.num_classes = num_classes
+        self.channel_axis = 1
+        self.spatial_axes = [2, 3]
 
         # Define the layers to combine UNet features and latent variable
         self.layers = nn.Sequential(
@@ -123,6 +168,17 @@ class Fcomb(nn.Module):
         )
 
         self.apply(init_weights)
+
+    def tile(self, a, dim, n_tile):
+        """
+        This function mimics TensorFlow's `tile()` function for PyTorch.
+        """
+        init_dim = a.size(dim)
+        repeat_idx = [1] * a.dim()
+        repeat_idx[dim] = n_tile
+        a = a.repeat(*repeat_idx)
+        order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])).to(device)
+        return torch.index_select(a, dim, order_index)
 
     def forward(self, feature_map, z):
 
@@ -137,8 +193,11 @@ class Fcomb(nn.Module):
             output (torch.Tensor): The final output tensor.
         """
         # Expand z to match the spatial dimensions of the feature map
-        z = z.unsqueeze(-1).unsqueeze(-1)
-        z = z.expand(-1, -1, feature_map.size(2), feature_map.size(3))
+        # Tile z to match feature map size
+        z = torch.unsqueeze(z, 2)
+        z = self.tile(z, 2, feature_map.shape[self.spatial_axes[0]])
+        z = torch.unsqueeze(z, 3)
+        z = self.tile(z, 3, feature_map.shape[self.spatial_axes[1]])
 
         # Concatenate feature map and latent variable
         h = torch.cat([feature_map, z], dim=1)
@@ -187,9 +246,10 @@ class ProbabilisticUNet(nn.Module):
         self.beta_2 = beta_2
         self.use_geco = use_geco
         self.lagrange_mult = 1.0
-        self.threshold_k = 0.14
+        self.threshold_k = 0.16
         self.mae_alpha = 0.9
         self.constraint_ma = 0
+        self.constraint = 0
 
         # Initialize the U-Net backbone
         self.unet = UNet(
@@ -316,11 +376,12 @@ class ProbabilisticUNet(nn.Module):
         )
 
         # KL divergence between posterior and standard Gaussian
-        #kl_div2 = kl.kl_divergence(self.posterior_latent_space, standard_gaussian)
+        kl_div2 = kl.kl_divergence(self.posterior_latent_space, standard_gaussian)
+        kl_div2 = torch.mean(kl_div2)
 
-        total_loss = self.beta_0 * total_recon_loss + self.beta_1 * kl_div #+ self.beta_2 * torch.mean(kl_div2)
+        total_loss = self.beta_0 * total_recon_loss + self.beta_1 * kl_div + self.beta_2 * kl_div2
 
-        return total_loss, total_recon_loss, kl_div#, kl_div2
+        return total_loss, total_recon_loss, kl_div, kl_div2
     
     def geco(self, x, target, t):
 
@@ -339,12 +400,12 @@ class ProbabilisticUNet(nn.Module):
         # Compute the output
         output = self.fcomb(unet_features, z_posterior)
 
-        constraint = torch.nn.L1Loss()(output, target) - self.threshold_k**2
+        self.constraint = torch.nn.L1Loss()(output, target) - self.threshold_k
         
         kl_div = kl.kl_divergence(self.posterior_latent_space, self.prior_latent_space)
         kl_div = torch.mean(kl_div)
 
-        geco_loss = kl_div + self.lagrange_mult * constraint
-        recon_loss = constraint + self.threshold_k**2
+        geco_loss = kl_div + self.lagrange_mult * self.constraint
+        recon_loss = self.constraint + self.threshold_k
 
         return geco_loss, recon_loss, kl_div

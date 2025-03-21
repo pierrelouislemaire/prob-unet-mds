@@ -29,13 +29,13 @@ def kgm2sTommday(data):
 # For inverse transformation
 def softplus_inv(data, threshold=20., c=1e-7):
     mask = data > threshold
-    data[mask] = data[mask]
+    #data[mask] = data[mask]
     data[~mask] = torch.log(torch.exp(data[~mask] + c) - 1.)
     return data
 
 def softplus(data, threshold=20., c=1e-7):
     mask = data > threshold
-    data[mask] = data[mask]
+    #data[mask] = data[mask]
     data[~mask] = torch.log(torch.exp(data[~mask]) + 1.) - c
     return data
         
@@ -145,7 +145,7 @@ class climex2torch(Dataset):
         # Tranformations (prep > 0 and tmax > tmin)
         if self.transfo:
             self.hr[:, 0, :, :] = softplus_inv(self.hr[:, 0, :, :])
-            self.hr[:, 2, :, :] = softplus_inv(self.hr[:, 2, :, :] - self.hr[:, 1, :, :], c=0.)
+            #self.hr[:, 2, :, :] = softplus_inv(self.hr[:, 2, :, :] - self.hr[:, 1, :, :], c=0.)
 
         client.close()
 

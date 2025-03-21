@@ -29,13 +29,13 @@ def get_args():
 
     # climate dataset arguments
     parser.add_argument('--datadir', type=str, default='/home/julie/Data/Climex/day/kdj/')
-    parser.add_argument('--variables', type=list, default=['pr', 'tasmin', 'tasmax'])
+    parser.add_argument('--variables', type=list, default=['pr', 'tas'])
     parser.add_argument('--years_train', type=range, default=range(1960, 1990))
     parser.add_argument('--years_subtrain', type=range, default=range(1960, 1980))
     parser.add_argument('--years_earlystop', type=range, default=range(1980, 1990))
     parser.add_argument('--years_val', type=range, default=range(1990, 1998))
-    parser.add_argument('--years_megatrain', type=range, default=range(1960, 1998))
-    parser.add_argument('--years_test', type=range, default=range(1998, 2006))
+    parser.add_argument('--years_megatrain', type=range, default=range(1960, 2000))
+    parser.add_argument('--years_test', type=range, default=range(2000, 2010))
     parser.add_argument('--coords', type=list, default=[80, 208, 100, 228])
     parser.add_argument('--resolution', type=tuple, default=(128, 128))
     parser.add_argument('--lowres_scale', type=int, default=16)
@@ -46,7 +46,7 @@ def get_args():
     parser.add_argument('--model', type=str, default='deterministic_unet', choices=['deterministic_unet', 'probabilistic_unet'])
 
     # ML training arguments
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_epochs', type=int, default=30)
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -132,7 +132,7 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
 
         running_losses_mae = []
         running_losses_kl = []
-        #running_losses_kl2 = []
+        running_losses_kl2 = []
         step_losses = []
 
         # Looping over the entire dataloader set
@@ -149,9 +149,8 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
             if prob:
                 if model.use_geco:
                     loss, recon_loss, kl_div = model.geco(inputs, targets, timestamps)
-                    model.lagrange_mult = model.lagrange_mult*torch.exp(model.constraint_ma)
                 else:
-                    loss, recon_loss, kl_div = model.elbo(inputs, targets, timestamps)
+                    loss, recon_loss, kl_div, kl_div2 = model.elbo(inputs, targets, timestamps)
                 reg_loss = l2_regularisation(model.posterior) + l2_regularisation(model.prior) + l2_regularisation(model.fcomb.layers)
                 loss = loss + 1e-5 * reg_loss
             else:
@@ -160,21 +159,30 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
             
             # Backward pass
             loss.backward()
+
+            if prob:
+                if model.use_geco:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
+                    with torch.no_grad():
+                        if model.constraint_ma == 0:
+                            model.constraint_ma = model.constraint.detach()
+                        else:
+                            model.constraint_ma = model.mae_alpha * model.constraint_ma.detach() + (1 - model.mae_alpha) * model.constraint
+                        model.lagrange_mult *= torch.exp(0.1*model.constraint_ma)
+
             optimizer.step()
 
             # Log losses for each variable
-            for idx, var in enumerate(variables):
-                if prob:
-                    running_losses_mae.append(recon_loss.item())
-                else:
-                    var_loss = torch.nn.L1Loss()(preds[:,idx,:,:], targets[:,idx,:,:])
-                    running_losses_mae[var].append(var_loss.item())
             if prob:
+                running_losses_mae.append(recon_loss.item())
                 running_losses_kl.append(kl_div.detach().cpu())
-                #running_losses_kl2.append(torch.mean(kl_div2).detach().cpu())
-
-            tq.set_postfix_str(s=f'Loss: {(loss.item()):.4f}')
-            step_losses.append(loss.item())
+                running_losses_kl2.append(kl_div2.detach().cpu())
+            else:
+                recon_loss = loss
+                running_losses_mae.append(recon_loss.item())
+                
+            tq.set_postfix_str(s=f'Loss: {(recon_loss):.4f}')
+            step_losses.append(recon_loss)
 
         mean_loss = sum(step_losses) / len(step_losses)
         tq.set_postfix_str(s=f'Loss: {mean_loss:.4f}')
@@ -182,8 +190,11 @@ def train_step(model, dataloader, loss_fn, optimizer, epoch, prob, device):
         epoch_losses_mae = sum(running_losses_mae) / len(running_losses_mae)
         if prob:
             epoch_losses_kl = sum(running_losses_kl) / len(running_losses_kl)
-            #epoch_losses_kl2 = sum(running_losses_kl2) / len(running_losses_kl2)
-            return epoch_losses_mae, epoch_losses_kl
+            epoch_losses_kl2 = sum(running_losses_kl2) / len(running_losses_kl2)
+            if model.use_geco:
+                return epoch_losses_mae, epoch_losses_kl, model.lagrange_mult.item()
+            else:
+                return epoch_losses_mae, epoch_losses_kl, epoch_losses_kl2
         else:
             return epoch_losses_mae
 

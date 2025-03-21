@@ -3,6 +3,7 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from scipy.stats import bootstrap
 from cartopy import crs as ccrs
 
@@ -13,15 +14,16 @@ import codebase.models.linearregression as lr
 
 if __name__ == "__main__":
 
+
     # -------------------------- #
     #          Load data         #
 
     args = tu.get_args()
 
     trainset = du.climex2torch(args.datadir, years=args.years_megatrain, coords=args.coords, lowres_scale=args.lowres_scale,
-                               transfo=args.transfo, type=args.pipeline)
+                               transfo=args.transfo, type=args.pipeline, megafile="src/data/data_megatrain.nc")
     testset = du.climex2torch(args.datadir, years=args.years_test, coords=args.coords, lowres_scale=args.lowres_scale,
-                              transfo=args.transfo, type=args.pipeline)
+                              transfo=args.transfo, type=args.pipeline, megafile="src/data/data_test.nc")
     testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 
     lat, lon = testset.data.lat[0].load().data, testset.data.lon[0].load().data
@@ -34,17 +36,24 @@ if __name__ == "__main__":
 
     test_nninterp = torch.nn.functional.interpolate(test_lr, scale_factor=args.lowres_scale, mode="nearest")
     test_bcsd = bcsd.BCSD(trainset, testset)
+    print("BCSD done")
     test_linearregression = lr.get_lr_preds()["test_preds"]
-    test_probunet = torch.from_numpy(np.load("src/codebase/predictions/probabilistic_unet_beta.npy"))
-    test_detunet = torch.from_numpy(np.load("src/codebase/predictions/deterministic_unet_dom128128.npy"))
+    print("Linear regression done")
+    test_probunet_5 = torch.from_numpy(np.load("src/codebase/predictions/probabilistic_unet_beta.npy"))[:, :16] 
+    print("Probabilistic unet beta done")
+    test_probunet_50 = torch.from_numpy(np.load("src/codebase/predictions/probabilistic_unet_beta_50.npy"))[:, :16]
+    print("Probabilistic unet tile done")
+    test_probunet_betascaling = torch.from_numpy(np.load("src/codebase/predictions/probabilistic_unet_betascaling.npy"))[:, :16]
+    test_detunet = torch.from_numpy(np.load("src/codebase/predictions/deterministic_unet.npy"))
+    print("Deterministic unet done")
 
-    preds_list = [test_nninterp, test_bcsd, test_linearregression, test_detunet, test_probunet]
-    list_names = ["1nn", "bcsd", "linear regression", "deterministic unet", "probabilistic unet"]
-    colors = ["teal", "magenta", "purple", "crimson", "orange"]
-    styles = ["-", "--", "-.", "--", "-"]
+    preds_list = [test_nninterp, test_bcsd, test_linearregression, test_detunet, test_probunet_5, test_probunet_50, test_probunet_betascaling]
+    list_names = ["1nn", "bcsd", "linear regression", "deterministic unet", "prob unet (beta = 5)", "probab unet (beta = 50)", "prob unet (scaling)"]
+    colors = mpl.colormaps["Set1"].colors[:len(list_names)]
+    styles = ["-", "--", "-.", "-", "--", "-.", "-"]
     #markers = [">", "*", "X", "<", "o"]
 
-    title_log = "beta"
+    title_log = "beta_50"
     os.makedirs(f"src/out/{title_log}", exist_ok=True)
 
     # -------------------------- #
@@ -64,7 +73,8 @@ if __name__ == "__main__":
             psd_i = metrics.compute_psd_over_groundtruth(preds, transfo=False)
         else:
             psd_i = metrics.compute_psd_over_groundtruth(preds, transfo=True)
-            if name == "probabilistic_unet":
+            """
+            if name == "probabilistic unet (tile)":
                 psd_ens = []
                 psd_std_low = {var: [] for var in args.variables}
                 psd_std_high = {var: [] for var in args.variables}
@@ -76,6 +86,7 @@ if __name__ == "__main__":
                         confint_wn = bootstrap(psd_ens[v, :, wn], np.std, n_resamples=1000, confidence_level=0.95).confidence_interval
                         psd_std_low[var].append(confint_wn[0])
                         psd_std_high[var].append(confint_wn[1])
+            """
 
         for v, var in enumerate(args.variables):
             psd[var].append(psd_i[v])
@@ -90,8 +101,8 @@ if __name__ == "__main__":
         axbis[-1].plot(scale_km, np.zeros_like(scale_km), alpha=0)
         for psd_i, name, color, style in zip(psd[args.variables[i]], psd_list_names, colors, styles):
             ax.plot(psd_i, color=color, linestyle=style, lw=2.5, label=name)
-            if name == "probabilistic_unet":
-                ax.fill_between(np.arange(psd_i.shape[0]), psd_std_low[args.variables[i]], psd_std_high[args.variables[i]], color=color, alpha=0.3)
+            #if name == "probabilistic unet (tile)":
+                #ax.fill_between(np.arange(psd_i.shape[0]), psd_std_low[args.variables[i]], psd_std_high[args.variables[i]], color=color, alpha=0.3)
         ax.text(0.8, 0.92, args.variables[i], fontsize=14, fontweight="bold", transform=ax.transAxes)
         ax.set_xlabel("Zonal wavenumber")
         ax.set_yscale('log')
@@ -106,45 +117,64 @@ if __name__ == "__main__":
     axs[2].legend(loc="lower left", fontsize=14)
     fig.savefig(f"src/out/{title_log}/psd.png")
 
+    del test_bcinterp
+    del psd_preds_list
+
+    del trainset
+    del testset
+
+    print("PSD done")
+
     # MAE, RMSE and CRPS
 
     test_hr = du.inv_transform(test_hr)
     test_nninterp = du.inv_transform(test_nninterp)
     test_linearregression = du.inv_transform(test_linearregression)
     test_detunet = du.inv_transform(test_detunet)
-    test_probunet = du.inv_transform(test_probunet, prob=True)
+
+    test_probunet_5 = du.inv_transform(test_probunet_5, prob=True)
+    test_probunet_50 = du.inv_transform(test_probunet_50, prob=True)
+    test_probunet_betascaling = du.inv_transform(test_probunet_betascaling, prob=True)
 
     test_bcsd[:, 0] = du.kgm2sTommday(test_bcsd[:, 0])
     test_bcsd[:, 1] = du.KToC(test_bcsd[:, 1])
     test_bcsd[:, 2] = du.KToC(test_bcsd[:, 2])
 
-    mae, rmse = [], []
+    mae, rmse, std_mae, std_rmse = [], [], [], []
     for preds in preds_list:
         if len(preds.shape) == 5:
             ens_mae = torch.abs(test_hr.unsqueeze(1) - preds).mean(dim=(0, 3, 4)).numpy()
             ens_rmse = torch.sqrt(((test_hr.unsqueeze(1) - preds) ** 2).mean(dim=(0, 3, 4))).numpy()
-            std_mae = np.std(ens_mae, axis=0)
-            std_rmse = np.std(ens_rmse, axis=0)
+            std_mae.append(np.std(ens_mae, axis=0))
+            std_rmse.append(np.std(ens_rmse, axis=0))
             preds = preds.mean(dim=1)
         mae.append(torch.abs(test_hr - preds).mean(dim=(0, 2, 3)).numpy())
         rmse.append(torch.sqrt(((test_hr - preds) ** 2).mean(dim=(0, 2, 3))).numpy())
-    crps_probunet = metrics.crps_over_groundtruth(test_hr, test_probunet)
+    crps_probunet_5 = metrics.crps_over_groundtruth(test_hr, test_probunet_5)
+    crps_probunet_50 = metrics.crps_over_groundtruth(test_hr, test_probunet_50)
+    crps_probunet_scaling = metrics.crps_over_groundtruth(test_hr, test_probunet_betascaling)
 
     f = open(f"src/out/{title_log}/reduced_metrics.txt", "w")
     f.write(f"MAE\n")
+    prob_count = 0
     for i, name in enumerate(list_names):
-        if name == "probabilistic unet":
-            f.write(f"{name}: {mae[i]} +/- {std_mae}\n")
+        if name == "prob unet (beta = 5)" or name == "probab unet (beta = 50)" or name == "prob unet (scaling)":
+            f.write(f"{name}: {mae[i]} +/- {std_mae[prob_count]}\n")
+            prob_count += 1
         else:
             f.write(f"{name}: {mae[i]}\n")
     f.write(f"\nRMSE\n")
+    prob_count = 0
     for i, name in enumerate(list_names):
-        if name == "probabilistic unet":
-            f.write(f"{name}: {rmse[i]} +/- {std_rmse}\n")
+        if name == "prob unet (beta = 5)" or name == "probab unet (beta = 50)" or name == "prob unet (scaling)":
+            f.write(f"{name}: {rmse[i]} +/- {std_rmse[prob_count]}\n")
+            prob_count += 1
         else:
             f.write(f"{name}: {rmse[i]}\n")
     f.write(f"\nCRPS\n")
-    f.write(f"probabilistic unet: {crps_probunet}\n")
+    f.write(f"probabilistic unet (beta = 5): {crps_probunet_5}\n")
+    f.write(f"probabilistic unet (beta = 50): {crps_probunet_50}\n")
+    f.write(f"probabilistic unet (scaling): {crps_probunet_scaling}\n")
     f.close()
 
     q_mae, q_rmse = metrics.quantile_mae_rmse(test_hr, preds_list, list_names)
@@ -204,31 +234,40 @@ if __name__ == "__main__":
 
     # Spread-Skill Ratio 
 
-    ssr_probunet = metrics.spread_skill_ratio(test_hr, test_probunet, reduction_dims=(0, 2, 3))
+    ssr_probunet_beta5 = metrics.spread_skill_ratio(test_hr, test_probunet_5, reduction_dims=(0, 2, 3))
+    ssr_probunet_beta50 = metrics.spread_skill_ratio(test_hr, test_probunet_50, reduction_dims=(0, 2, 3))
+    ssr_probunet_betascaling = metrics.spread_skill_ratio(test_hr, test_probunet_betascaling, reduction_dims=(0, 2, 3))
     f = open(f"src/out/{title_log}/reduced_metrics.txt", "a")
     f.write(f"\nSSR\n")
-    f.write(f"probabilistic unet: {ssr_probunet}\n")
+    f.write(f"probabilistic unet (beta = 5): {ssr_probunet_beta5}\n")
+    f.write(f"probabilistic unet (beta = 50): {ssr_probunet_beta50}\n")
+    f.write(f"probabilistic unet (scaling): {ssr_probunet_betascaling}\n")
     f.close()
 
-    spatial_ssr_probunet = metrics.spread_skill_ratio(test_hr, test_probunet, reduction_dims=0)
+    spatial_ssr_probunet_beta5 = metrics.spread_skill_ratio(test_hr, test_probunet_5, reduction_dims=0)
+    spatial_ssr_probunet_beta50 = metrics.spread_skill_ratio(test_hr, test_probunet_50, reduction_dims=0)
+    spatial_ssr_probunet_betascaling = metrics.spread_skill_ratio(test_hr, test_probunet_betascaling, reduction_dims=0)
+
 
     # Initializing Plate Carrée and Rotated Pole projections (for other projections see https://scitools.org.uk/cartopy/docs/latest/reference/crs.html)
     rotatedpole_prj = ccrs.RotatedPole(pole_longitude=83.0, pole_latitude=42.5)
     platecarree_proj = ccrs.PlateCarree()
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5), subplot_kw={'projection': rotatedpole_prj})
-    for i, ax in enumerate(axs):
-        ax.coastlines()
-        gl = ax.gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
-        gl.top_labels = False
-        gl.right_labels = False
-        if i>0:
-            gl.left_labels = False
-            vmin, vmax = - np.abs(spatial_ssr_probunet[1:]).max(), np.abs(spatial_ssr_probunet[1:]).max()
-        else:
-            vmin, vmax = - np.abs(spatial_ssr_probunet[0]).max(), np.abs(spatial_ssr_probunet[0]).max()
-        im = ax.pcolormesh(lon, lat, spatial_ssr_probunet[i], transform=platecarree_proj, cmap="PiYG", vmin=vmin, vmax=vmax)
-        ax.set_title(args.variables[i])
-        plt.colorbar(im, extend="both", shrink=0.75)
+    fig, axs = plt.subplots(3, 3, figsize=(15, 15), subplot_kw={'projection': rotatedpole_prj})
+    for i, ax_i in enumerate(axs):
+        spatial_ssr_probunet = [spatial_ssr_probunet_beta5, spatial_ssr_probunet_beta50, spatial_ssr_probunet_betascaling][i]
+        for j, ax in enumerate(ax_i):
+            ax.coastlines()
+            gl = ax.gridlines(crs=platecarree_proj, draw_labels=True, x_inline=False, y_inline=False, linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+            if j>0:
+                gl.left_labels = False
+                vmin, vmax = - np.abs(spatial_ssr_probunet[1:]).max(), np.abs(spatial_ssr_probunet[1:]).max()
+            else:
+                vmin, vmax = - np.abs(spatial_ssr_probunet[0]).max(), np.abs(spatial_ssr_probunet[0]).max()
+            im = ax.pcolormesh(lon, lat, spatial_ssr_probunet[i], transform=platecarree_proj, cmap="PiYG", vmin=vmin, vmax=vmax)
+            ax.set_title(args.variables[j])
+            plt.colorbar(im, extend="both", shrink=0.75)
     fig.savefig(f"src/out/{title_log}/spatial_ssr.png")
 
     # SAL
@@ -240,30 +279,33 @@ if __name__ == "__main__":
         f.write(f"{name}: {sal}\n")
     f.close()
 
-    # Training reconstruction error + KL w/ beta annealing
-    
-    training_mae = np.load("src/codebase/logs/probabilistic_unet_beta_mae.npy")
-    training_kl = np.load("src/codebase/logs/probabilistic_unet_beta_kl.npy")
+    """
 
-    nb_epochs = training_mae.shape[0]
-    betas = np.cat(np.array([1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]), np.ones(nb_epochs-8))
+    # Training reconstruction error + KL w/ geco
+
+    training_mae_50 = np.load("src/logs/probabilistic_unet_beta_mae_50.npy")
+    training_kl_50 = np.load("src/logs/probabilistic_unet_beta_kl_50.npy")
 
     fig = plt.figure(figsize=(10, 5))
     ax = fig.add_subplot(111)
 
-    ax.plot(np.arange(1, nb_epochs+1), training_mae, label="MAE", color="teal")
+    ax.plot(np.arange(1, 30+1), training_mae_50, label="MAE", color="teal")
     ax.set_ylabel("MAE")
     ax.set_xlabel("Epoch")
 
     ax2 = ax.twinx()
-    ax2.plot(np.arange(1, nb_epochs+1), training_kl, label="KL", color="magenta")
+    ax2.plot(np.arange(1, 30+1), training_kl_50, label="KL", color="magenta")
     ax2.set_ylabel("KL")
     ax2.set_xlabel("Epoch")
     
-    ax2.set_xticks(np.arange(1, 9, 1), [f"{i} \n 1e-{i}" for i in range(9)])
-
     fig.legend()
     fig.savefig(f"src/out/{title_log}/training_curves.png")
+
+    """
+
+
+
+
 
 
 
